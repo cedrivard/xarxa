@@ -115,19 +115,35 @@ impl core::fmt::Display for DhcpServerError {
 impl core::error::Error for DhcpServerError {}
 
 /// The state of one [`DhcpServerLease`].
+///
+/// An offered, bound or declined lease holds its address until `expires_at`.
+/// Once a poll finds that time has passed, an offered or bound lease becomes
+/// `Expired`, and a declined one is removed from the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DhcpServerLeaseState {
     /// The address was offered and the client has not requested it yet.
-    Offered,
+    Offered {
+        /// When the offer lapses.
+        expires_at: Instant,
+    },
     /// The client holds the address.
-    Bound,
+    Bound {
+        /// When the lease ends.
+        expires_at: Instant,
+    },
+    /// The client reported the address as in use by someone else. The address
+    /// is kept out of the pool until the hold ends.
+    Declined {
+        /// When the hold ends.
+        expires_at: Instant,
+    },
     /// The client released the address, or chose another server. Kept as a
     /// record so a returning client gets the same address.
     Released,
-    /// The client reported the address as in use by someone else. The address
-    /// is kept out of the pool until the hold expires.
-    Declined,
+    /// The offer lapsed, or the lease ended. Kept as a record so a returning
+    /// client gets the same address.
+    Expired,
 }
 
 /// One entry of the DHCP server's lease table.
@@ -143,7 +159,6 @@ pub struct DhcpServerLease {
     client_id: [u8; DHCP_SERVER_CLIENT_ID_SIZE],
     client_id_len: u8,
     state: DhcpServerLeaseState,
-    expires_at: Instant,
 }
 
 impl DhcpServerLease {
@@ -154,7 +169,6 @@ impl DhcpServerLease {
             client_id: [0; DHCP_SERVER_CLIENT_ID_SIZE],
             client_id_len: 0,
             state: DhcpServerLeaseState::Released,
-            expires_at: Instant::from_millis(0),
         };
         if let ClientId::Id(bytes) = id {
             lease.client_id[..bytes.len()].copy_from_slice(bytes);
@@ -182,29 +196,28 @@ impl DhcpServerLease {
         }
     }
 
-    /// The state of the lease.
+    /// The state of the lease, with when it ends if it holds its address.
     pub fn state(&self) -> DhcpServerLeaseState {
         self.state
-    }
-
-    /// When the lease stops holding its address.
-    ///
-    /// For an offered lease this is when the unanswered offer lapses, for a
-    /// bound one the end of the lease, and for a declined one the end of the
-    /// hold that keeps the address out of the pool. A released lease is already
-    /// past it. Past this time the entry is only a record: the address is free,
-    /// and the entry makes a returning client get it again.
-    pub fn expires_at(&self) -> Instant {
-        self.expires_at
     }
 
     /// Whether the lease still holds its address.
     fn is_active(&self, now: Instant) -> bool {
         match self.state {
-            DhcpServerLeaseState::Released => false,
-            DhcpServerLeaseState::Offered | DhcpServerLeaseState::Bound | DhcpServerLeaseState::Declined => {
-                self.expires_at > now
+            DhcpServerLeaseState::Offered { expires_at }
+            | DhcpServerLeaseState::Bound { expires_at }
+            | DhcpServerLeaseState::Declined { expires_at } => expires_at > now,
+            DhcpServerLeaseState::Released | DhcpServerLeaseState::Expired => false,
+        }
+    }
+
+    /// How long the lease has left, if it is bound to `addr`.
+    fn bound_time_left(&self, addr: Ipv4Addr, now: Instant) -> Option<Duration> {
+        match self.state {
+            DhcpServerLeaseState::Bound { expires_at } if self.address == addr && expires_at > now => {
+                Some(expires_at - now)
             }
+            _ => None,
         }
     }
 
@@ -258,6 +271,32 @@ impl Server {
         &self.leases
     }
 
+    /// End the offers, leases and holds that ran out. An offer or a lease becomes
+    /// an `Expired` record, and a hold goes away. Records stay in the table for
+    /// long, and keep no time.
+    ///
+    /// Nothing is due at those times, so they don't count toward the deadline.
+    /// The lookups check them themselves.
+    pub(crate) fn expire(&mut self, now: Instant) {
+        let mut i = 0;
+        while let Some(lease) = self.leases.get_mut(i) {
+            match lease.state {
+                // An ended hold blocks nothing, and belongs to no client.
+                DhcpServerLeaseState::Declined { expires_at } if expires_at <= now => {
+                    self.leases.remove(i);
+                    continue;
+                }
+                DhcpServerLeaseState::Offered { expires_at } | DhcpServerLeaseState::Bound { expires_at }
+                    if expires_at <= now =>
+                {
+                    lease.state = DhcpServerLeaseState::Expired;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
     pub(crate) fn remove_lease(&mut self, address: Ipv4Addr) -> bool {
         let len = self.leases.len();
         self.leases.retain(|lease| lease.address != address);
@@ -273,7 +312,7 @@ impl Server {
     fn find_by_client(&self, id: &ClientId<'_>) -> Option<usize> {
         self.leases
             .iter()
-            .position(|lease| lease.state != DhcpServerLeaseState::Declined && lease.matches_client(id))
+            .position(|lease| !matches!(lease.state, DhcpServerLeaseState::Declined { .. }) && lease.matches_client(id))
     }
 
     /// Whether `addr` can be given to the client `id`: no active lease holds it,
@@ -282,13 +321,13 @@ impl Server {
         !self.leases.iter().any(|lease| {
             lease.address == addr
                 && lease.is_active(now)
-                && (lease.state == DhcpServerLeaseState::Declined || !lease.matches_client(id))
+                && (matches!(lease.state, DhcpServerLeaseState::Declined { .. }) || !lease.matches_client(id))
         })
     }
 
     /// The lease table slot for this client: its existing lease, a fresh one, or
-    /// one reclaimed from the longest-expired record. `None` if every slot holds
-    /// an active lease.
+    /// the first slot of a lease that is over. `None` if every slot holds an
+    /// active lease.
     fn entry_for(&mut self, id: &ClientId<'_>, chaddr: EthernetAddress, now: Instant) -> Option<usize> {
         if let Some(i) = self.find_by_client(id) {
             self.leases[i].hardware_addr = chaddr;
@@ -297,13 +336,7 @@ impl Server {
         match self.leases.push(DhcpServerLease::new(id, chaddr)) {
             Ok(()) => Some(self.leases.len() - 1),
             Err(lease) => {
-                let i = self
-                    .leases
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| !l.is_active(now))
-                    .min_by_key(|(_, l)| l.expires_at)
-                    .map(|(i, _)| i)?;
+                let i = self.leases.iter().position(|l| !l.is_active(now))?;
                 self.leases[i] = lease;
                 Some(i)
             }
@@ -385,8 +418,9 @@ impl Server {
                 {
                     // RFC 2131 §4.3.3: the address is in use by someone else.
                     warn!("DHCP server: {} declined {}, possible address conflict", chaddr, addr);
-                    self.leases[i].state = DhcpServerLeaseState::Declined;
-                    self.leases[i].expires_at = now + DECLINE_TIMEOUT;
+                    self.leases[i].state = DhcpServerLeaseState::Declined {
+                        expires_at: now + DECLINE_TIMEOUT,
+                    };
                 }
                 None
             }
@@ -398,7 +432,6 @@ impl Server {
                 {
                     debug!("DHCP server: {} released {}", chaddr, addr);
                     self.leases[i].state = DhcpServerLeaseState::Released;
-                    self.leases[i].expires_at = now;
                 }
                 None
             }
@@ -452,15 +485,11 @@ impl Server {
 
         // RFC 2131 §4.3.1: a client with a running lease that asks for no
         // specific one is offered the time it has left.
-        let duration = match self.find_by_client(id) {
-            Some(i)
-                if requested_lease.is_none()
-                    && self.leases[i].state == DhcpServerLeaseState::Bound
-                    && self.leases[i].address == addr
-                    && self.leases[i].expires_at > now =>
-            {
-                self.leases[i].expires_at - now
-            }
+        let time_left = self
+            .find_by_client(id)
+            .and_then(|i| self.leases[i].bound_time_left(addr, now));
+        let duration = match time_left {
+            Some(time_left) if requested_lease.is_none() => time_left,
             _ => self.lease_duration(requested_lease),
         };
 
@@ -470,10 +499,11 @@ impl Server {
         };
         let lease = &mut self.leases[i];
         // Offering a client its own running lease must not shorten it.
-        if !(lease.state == DhcpServerLeaseState::Bound && lease.address == addr && lease.expires_at > now) {
-            lease.state = DhcpServerLeaseState::Offered;
+        if lease.bound_time_left(addr, now).is_none() {
+            lease.state = DhcpServerLeaseState::Offered {
+                expires_at: now + OFFER_TIMEOUT,
+            };
             lease.address = addr;
-            lease.expires_at = now + OFFER_TIMEOUT;
         }
 
         debug!("DHCP server: offering {} to {}", addr, chaddr);
@@ -510,7 +540,6 @@ impl Server {
             if let Some(i) = self.find_by_client(id) {
                 debug!("DHCP server: {} chose another server", chaddr);
                 self.leases[i].state = DhcpServerLeaseState::Released;
-                self.leases[i].expires_at = now;
             }
             return None;
         }
@@ -566,8 +595,9 @@ impl Server {
                 };
                 let lease = &mut self.leases[i];
                 lease.address = addr;
-                lease.state = DhcpServerLeaseState::Bound;
-                lease.expires_at = now + duration;
+                lease.state = DhcpServerLeaseState::Bound {
+                    expires_at: now + duration,
+                };
                 debug!("DHCP server: leased {} to {}", addr, chaddr);
                 self.build_reply(
                     server_cidr,
@@ -1099,8 +1129,12 @@ mod test {
             assert_eq!(leases[0].address(), POOL_START);
             assert_eq!(leases[0].hardware_addr(), CLIENT_HW);
             assert_eq!(leases[0].client_id(), None);
-            assert_eq!(leases[0].state(), DhcpServerLeaseState::Offered);
-            assert_eq!(leases[0].expires_at(), at(0) + OFFER_TIMEOUT);
+            assert_eq!(
+                leases[0].state(),
+                DhcpServerLeaseState::Offered {
+                    expires_at: at(0) + OFFER_TIMEOUT
+                }
+            );
         }
 
         // REQUEST of the offer: an ACK, and the lease is bound.
@@ -1128,8 +1162,12 @@ mod test {
         {
             let leases = leases(&mut stack);
             assert_eq!(leases.len(), 1);
-            assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
-            assert_eq!(leases[0].expires_at(), at(1) + Duration::from_secs(LEASE_SECS));
+            assert_eq!(
+                leases[0].state(),
+                DhcpServerLeaseState::Bound {
+                    expires_at: at(1) + Duration::from_secs(LEASE_SECS)
+                }
+            );
         }
     }
 
@@ -1227,7 +1265,7 @@ mod test {
         // The holder keeps its lease.
         let leases = leases(&mut stack);
         assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
+        assert!(matches!(leases[0].state(), DhcpServerLeaseState::Bound { .. }));
     }
 
     #[test]
@@ -1253,8 +1291,12 @@ mod test {
             assert_eq!(packet.your_ip(), POOL_START);
         }
         let leases = leases(&mut stack);
-        assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
-        assert_eq!(leases[0].expires_at(), at(100) + Duration::from_secs(LEASE_SECS));
+        assert_eq!(
+            leases[0].state(),
+            DhcpServerLeaseState::Bound {
+                expires_at: at(100) + Duration::from_secs(LEASE_SECS)
+            }
+        );
     }
 
     #[test]
@@ -1273,7 +1315,7 @@ mod test {
         let leases = leases(&mut stack);
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].address(), POOL_START);
-        assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
+        assert!(matches!(leases[0].state(), DhcpServerLeaseState::Bound { .. }));
 
         // A renewal of an address outside the pool is not ours: silence.
         send(
@@ -1369,8 +1411,12 @@ mod test {
         assert_eq!(tx.borrow().len(), 2); // no reply to DECLINE
         {
             let leases = leases(&mut stack);
-            assert_eq!(leases[0].state(), DhcpServerLeaseState::Declined);
-            assert_eq!(leases[0].expires_at(), at(2) + DECLINE_TIMEOUT);
+            assert_eq!(
+                leases[0].state(),
+                DhcpServerLeaseState::Declined {
+                    expires_at: at(2) + DECLINE_TIMEOUT
+                }
+            );
         }
 
         // The declining client discovers again and gets a different address.
@@ -1393,6 +1439,15 @@ mod test {
         );
         let mut sent = last_sent(&tx);
         assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
+
+        // The entry that held it is gone.
+        let leases = leases(&mut stack);
+        assert_eq!(leases.len(), 2);
+        assert!(
+            leases
+                .iter()
+                .all(|lease| !matches!(lease.state(), DhcpServerLeaseState::Declined { .. }))
+        );
     }
 
     #[test]
@@ -1420,6 +1475,29 @@ mod test {
             Msg::new(DhcpMessageType::Discover, CLIENT3_HW),
             LEASE_SECS as i64 + 2,
         );
+        let mut sent = last_sent(&tx);
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Offer);
+        assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
+    }
+
+    /// A poll turns a lease that ran out into an `Expired` record. Weeks later its
+    /// address is still free for another client.
+    #[test]
+    fn test_expired_lease_becomes_record() {
+        let (mut stack, rx, tx) = test_stack();
+        bind_first_client(&mut stack, &rx, 0);
+
+        // Idle for 30 days, polled once a day.
+        let mut now = at(0);
+        for _ in 0..30 {
+            now += Duration::from_secs(24 * 60 * 60);
+            stack.poll(now);
+        }
+        assert_eq!(leases(&mut stack)[0].state(), DhcpServerLeaseState::Expired);
+
+        rx.borrow_mut()
+            .push_back(frame(&Msg::new(DhcpMessageType::Discover, CLIENT2_HW)));
+        stack.poll(now);
         let mut sent = last_sent(&tx);
         assert_eq!(message_type(&mut sent), DhcpMessageType::Offer);
         assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
@@ -1552,7 +1630,7 @@ mod test {
         {
             let leases = leases(&mut stack);
             assert_eq!(leases[0].client_id(), Some(&id[..]));
-            assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
+            assert!(matches!(leases[0].state(), DhcpServerLeaseState::Bound { .. }));
         }
 
         // The same identifier from another hardware address is the same client
@@ -1781,7 +1859,7 @@ mod test {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].address(), POOL_START);
         assert_eq!(leases[0].hardware_addr(), CLIENT_HW);
-        assert_eq!(leases[0].state(), DhcpServerLeaseState::Bound);
+        assert!(matches!(leases[0].state(), DhcpServerLeaseState::Bound { .. }));
         // The client sent a client identifier built from its hardware address.
         assert_eq!(leases[0].client_id(), Some(&[1, 0x02, 0, 0, 0, 0, 0x42][..]));
     }

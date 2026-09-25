@@ -601,8 +601,7 @@ impl<'d> Iface<'_, 'd> {
     /// The DHCP server's lease table. Empty if the server is off.
     ///
     /// All entries are returned, whether their lease is running or already over.
-    /// Check each entry's [`state`](self::dhcpv4_server::DhcpServerLease::state)
-    /// and [`expires_at`](self::dhcpv4_server::DhcpServerLease::expires_at).
+    /// Check each entry's [`state`](self::dhcpv4_server::DhcpServerLease::state).
     #[cfg(feature = "dhcpv4-server")]
     pub fn dhcpv4_server_leases(&self) -> &[self::dhcpv4_server::DhcpServerLease] {
         match &self.state().dhcpv4_server {

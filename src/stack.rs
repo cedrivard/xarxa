@@ -1141,6 +1141,11 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_poll(&mut self.inner, &mut clock);
 
+            #[cfg(feature = "dhcpv4-server")]
+            if let Some(server) = &mut self.ifaces.get_mut(index).dhcpv4_server {
+                server.expire(clock.now());
+            }
+
             #[cfg(feature = "slaac")]
             self.ifaces.get_mut(index).slaac_poll(&mut self.inner, &mut clock);
 
