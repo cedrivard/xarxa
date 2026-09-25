@@ -2785,6 +2785,7 @@ impl<'d> TcpSocket<'_, 'd> {
             return Err(SendError::InvalidState);
         }
 
+        let now = self.tx.inner.now;
         let s = self.inner_mut();
         let old_length = s.tx_buffer.len();
         let was_armed = s.timeout_armed();
@@ -2802,10 +2803,7 @@ impl<'d> TcpSocket<'_, 'd> {
             if s.remote_win_len == 0 && s.timer.is_idle() {
                 let delay = s.rtte.retransmission_timeout();
                 trace!("starting zero-window-probe timer for t+{}", delay);
-
-                // We don't have access to the current time here, so use Instant::ZERO instead.
-                // this will cause the first ZWP to be sent immediately, but that's okay.
-                s.timer.set_for_zero_window_probe(Instant::ZERO, delay);
+                s.timer.set_for_zero_window_probe(now, delay);
             }
 
             trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
@@ -9313,6 +9311,39 @@ mod test {
         recv!(
             s,
             time 3000,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"a"[..],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// Data sent into a zero window waits one RTO for the first probe (RFC 9293
+    /// §3.8.6.1), counted from the send.
+    #[test]
+    fn test_zero_window_probe_first_after_send() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                ..SEND_TEMPL
+            }
+        );
+        recv_nothing!(s, time 5000);
+        s.view().send_slice(b"abcdef").unwrap();
+
+        let probe_at = 5000 + s.rtte.retransmission_timeout().as_millis() as i64;
+        recv_nothing!(s, time 5000);
+        assert_eq!(s.deadline, Instant::from_millis(probe_at));
+        recv_nothing!(s, time probe_at - 1);
+        recv!(
+            s,
+            time probe_at,
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
