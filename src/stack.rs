@@ -1213,6 +1213,10 @@ impl<'d> Stack<'d> {
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
 
+        // Expired routes go. That isn't due at any particular time, so it doesn't
+        // count toward the deadline: a lookup checks the expiry itself.
+        self.inner.routes.remove_expired(clock.now());
+
         clock.next()
     }
 }
@@ -4739,6 +4743,26 @@ pub(crate) mod test {
             stack.udp_socket(handle).take_icmp_error(),
             Some((IcmpError::PortUnreachable, SocketAddr::new(REMOTE_V6.into(), 53)))
         );
+    }
+
+    /// An expired route is not used, and the next poll removes it.
+    #[test]
+    fn test_expired_route_removed() {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let route = crate::route::Route {
+            expires_at: Some(Instant::from_secs(1)),
+            ..crate::route::Route::new_ipv4_gateway(Ipv4Addr::new(192, 168, 1, 254), IfaceHandle::new(0))
+        };
+        stack.routes_mut().add(route).unwrap();
+        let dst = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        stack.poll(Instant::ZERO);
+        assert!(stack.routes().lookup(IfaceBinding::Any, &dst, Instant::ZERO).is_some());
+
+        let expired = Instant::from_secs(1);
+        assert!(stack.routes().lookup(IfaceBinding::Any, &dst, expired).is_none());
+        assert_eq!(stack.routes().len(), 1);
+        stack.poll(expired);
+        assert!(stack.routes().is_empty());
     }
 
     #[test]

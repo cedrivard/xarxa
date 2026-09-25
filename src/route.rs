@@ -59,7 +59,8 @@ pub struct Route {
     pub origin: RouteOrigin,
     /// `None` means "forever".
     pub preferred_until: Option<Instant>,
-    /// `None` means "forever".
+    /// `None` means "forever". An expired route is removed from the table at the
+    /// next poll.
     pub expires_at: Option<Instant>,
 }
 
@@ -301,6 +302,20 @@ impl Routes {
             })
             // pick the most specific one (highest prefix_len)
             .max_by_key(|route| route.cidr.prefix_len())
+    }
+
+    /// Remove the routes that expired. A lookup ignores them already, this
+    /// keeps them from taking up room in the table.
+    pub(crate) fn remove_expired(&mut self, now: Instant) {
+        // Not `retain`: that is a new copy of the loop for every closure.
+        let mut i = 0;
+        while let Some(route) = self.storage.get(i) {
+            if route.expires_at.is_some_and(|expires_at| expires_at <= now) {
+                self.storage.remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Remove all routes that go out of the given interface.
