@@ -1803,13 +1803,25 @@ impl<'d> TcpSocketState<'d> {
         };
         let now = clock.now();
 
+        // A delayed ACK that is due stays due until an ACK goes out, and a passed
+        // challenge ACK limit limits nothing. Neither needs to keep its time once
+        // it has passed.
+        if let AckDelayTimer::Waiting(t) = self.ack_delay_timer
+            && t <= now
+        {
+            self.ack_delay_timer = AckDelayTimer::Immediate;
+        }
+        if self.challenge_ack_timer < now {
+            self.challenge_ack_timer = now;
+        }
+
         if self.remote_last_ts.is_none() && self.timeout_armed() {
             // The timeout just became armed: the socket entered SYN-SENT or
-            // SYN-RECEIVED, got data or a FIN to send while idle, or had keep-alive
-            // enabled while idle. The socket has been quiet for an indefinite period
-            // of time, it isn't anymore, and the local peer is talking. So, we start
-            // counting the timeout not from the last received packet but from the
-            // first transmitted one.
+            // SYN-RECEIVED, got data or a FIN to send while idle, had keep-alive
+            // enabled while idle, or had a timeout set. The socket has been quiet
+            // for an indefinite period of time, it isn't anymore, and the local peer
+            // is talking. So, we start counting the timeout not from the last
+            // received packet but from the first transmitted one.
             self.remote_last_ts = Some(now);
         }
 
@@ -2351,8 +2363,14 @@ impl<'d> TcpSocket<'_, 'd> {
     ///     the specified duration between any two packets it sends.
     ///
     /// An idle connection, with nothing to send and keep-alive disabled, never times out.
+    ///
+    /// Setting a timeout restarts the count: the peer has the whole duration from then on.
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
-        self.inner_mut().timeout = duration
+        let s = self.inner_mut();
+        // With no timeout set, the time of the last packet received is never
+        // checked, and can be arbitrarily old.
+        s.remote_last_ts = None;
+        s.timeout = duration;
     }
 
     /// Set the ACK delay duration.
@@ -6347,6 +6365,34 @@ mod test {
         );
     }
 
+    /// The challenge ACK rate limit doesn't come back to life on a connection that
+    /// stays idle for weeks.
+    #[test]
+    fn test_challenge_ack_after_long_idle() {
+        let mut s = socket_established();
+        let bad_seq = TcpRepr {
+            seq_number: REMOTE_SEQ, // Wrong seq
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        };
+        let challenge_ack = TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        };
+        send!(s, time 0, bad_seq, Some(challenge_ack));
+        // At most one per second.
+        send!(s, time 500, bad_seq, None);
+
+        // Idle for 30 days, polled once a day.
+        let mut now = Instant::ZERO;
+        for _ in 0..30 {
+            now += Duration::from_secs(24 * 60 * 60);
+            recv_nothing(&mut s, now);
+        }
+        assert_eq!(send(&mut s, now, &bad_seq), Some(challenge_ack));
+    }
+
     // =========================================================================================//
     // Tests for the FIN-WAIT-1 state.
     // =========================================================================================//
@@ -9498,6 +9544,38 @@ mod test {
         assert_eq!(s.state, State::Closed);
     }
 
+    /// A timeout set on a connection that went unanswered for a long time counts
+    /// from when it is set, not from the last packet received, long before.
+    #[test]
+    fn test_timeout_set_after_long_silence() {
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+
+        // The remote never answers, and the data is retransmitted for 30 days.
+        let mut now = 0i64;
+        while now < 30 * 24 * 60 * 60 * 1000 {
+            recv(&mut s, Instant::from_millis(now), 1, |_, repr| {
+                assert_eq!(repr.payload, &b"abcdef"[..]);
+            });
+            now = s.deadline.as_millis();
+        }
+
+        // The retransmissions go on until the timeout is up.
+        s.view().set_timeout(Some(Duration::from_secs(60)));
+        recv(&mut s, Instant::from_millis(now), 1, |_, repr| {
+            assert_eq!(repr.payload, &b"abcdef"[..]);
+        });
+        let timeout_at = now + 60_000;
+        assert_eq!(s.deadline, Instant::from_millis(timeout_at));
+        recv!(s, time timeout_at, Ok(TcpRepr {
+            control:    TcpControl::Rst,
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.state, State::Closed);
+    }
+
     #[test]
     fn test_established_idle_no_timeout() {
         let mut s = socket_established();
@@ -10205,6 +10283,61 @@ mod test {
             window_len: 61,
             ..RECV_TEMPL
         }));
+    }
+
+    /// A challenge ACK acknowledges the data a delayed ACK was waiting for, which
+    /// leaves the delayed ACK due. Weeks later it still is: the next data is
+    /// acknowledged at once.
+    #[test]
+    fn test_delayed_ack_after_long_idle() {
+        let mut s = socket_established();
+        s.view().set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv_nothing!(s);
+        send!(
+            s,
+            time 1,
+            TcpRepr {
+                seq_number: REMOTE_SEQ, // Wrong seq
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 61,
+                ..RECV_TEMPL
+            })
+        );
+
+        // Idle for 30 days, polled once a day.
+        let mut now = Instant::from_millis(1);
+        for _ in 0..30 {
+            now += Duration::from_secs(24 * 60 * 60);
+            recv_nothing(&mut s, now);
+        }
+
+        send(
+            &mut s,
+            now,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"def"[..],
+                ..SEND_TEMPL
+            },
+        );
+        recv(&mut s, now, 1, |_, repr| {
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + 6));
+        });
     }
 
     #[test]
