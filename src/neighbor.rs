@@ -125,7 +125,7 @@ pub enum NeighborState {
     Reachable {
         /// The neighbor's hardware address.
         hardware_addr: HardwareAddress,
-        /// When the entry expires. `Instant::MAX` means never.
+        /// When the entry expires.
         expires_at: Instant,
     },
     /// The entry expired. The stack no longer sends to this hardware address.
@@ -338,10 +338,13 @@ impl NeighborCache {
 
     /// Add or replace an entry, mapping `addr` on `iface` to `hardware_addr`.
     ///
-    /// `expires_at` is when the entry stops being used. Pass `Instant::MAX` for
-    /// a static entry that never expires. Note that ARP or neighbor discovery
-    /// can still replace it if the neighbor answers with a different hardware
-    /// address.
+    /// `expires_at` is when the entry stops being used. There are no static
+    /// entries. To keep an entry, insert it again before it expires.
+    ///
+    /// The stack changes the entry too:
+    /// - Traffic from the neighbor sets it to expire 60 s later.
+    /// - ARP or neighbor discovery replaces it if the neighbor answers with a
+    ///   different hardware address.
     ///
     /// If the cache is full, another entry is evicted to make room.
     ///
@@ -591,13 +594,14 @@ mod test {
     #[test]
     fn insert_rejects_non_unicast() {
         let mut cache = NeighborCache::new();
+        let expires_at = Instant::from_secs(60);
         let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
         assert_eq!(
-            cache.insert(IF_0, all_nodes.into(), HADDR_A, Instant::MAX),
+            cache.insert(IF_0, all_nodes.into(), HADDR_A, expires_at),
             Err(NotUnicast)
         );
         assert_eq!(
-            cache.insert(IF_0, Ipv6Addr::UNSPECIFIED.into(), HADDR_A, Instant::MAX),
+            cache.insert(IF_0, Ipv6Addr::UNSPECIFIED.into(), HADDR_A, expires_at),
             Err(NotUnicast)
         );
         #[cfg(feature = "medium-ethernet")]
@@ -606,15 +610,13 @@ mod test {
                 IF_0,
                 MOCK_IP_ADDR_1.into(),
                 HardwareAddress::Ethernet(crate::wire::EthernetAddress::BROADCAST),
-                Instant::MAX
+                expires_at
             ),
             Err(NotUnicast)
         );
         assert!(cache.is_empty());
 
-        cache
-            .insert(IF_0, MOCK_IP_ADDR_1.into(), HADDR_A, Instant::MAX)
-            .unwrap();
+        cache.insert(IF_0, MOCK_IP_ADDR_1.into(), HADDR_A, expires_at).unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),

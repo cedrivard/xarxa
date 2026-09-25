@@ -1920,7 +1920,7 @@ mod test {
         stack.poll(at(2));
         assert_eq!(tx.borrow().len(), 2);
         assert!(stack.iface(IFACE).dhcpv4_lease().is_some());
-        // A static neighbor entry for the server, so the renew REQUEST goes
+        // A long-lived neighbor entry for the server, so the renew REQUEST goes
         // straight out instead of parking on ARP. Added after the lease is
         // applied: a new address clears the interface's neighbor cache.
         stack
@@ -1929,7 +1929,7 @@ mod test {
                 IFACE,
                 IpAddr::V4(SERVER_IP),
                 HardwareAddress::Ethernet(SERVER_HW),
-                Instant::MAX,
+                at(0) + Duration::from_secs(24 * 60 * 60),
             )
             .unwrap();
 
@@ -1978,7 +1978,7 @@ mod test {
         assert_eq!(stack.poll(at(0)), at(500));
         assert_eq!(tx.borrow().len(), 2);
         assert!(stack.iface(IFACE).dhcpv4_lease().is_some());
-        // A static neighbor entry for the server, so the renew REQUESTs go
+        // A long-lived neighbor entry for the server, so the renew REQUESTs go
         // straight out instead of parking on ARP. Added after the lease is
         // applied: a new address clears the interface's neighbor cache.
         stack
@@ -1987,7 +1987,7 @@ mod test {
                 IFACE,
                 IpAddr::V4(SERVER_IP),
                 HardwareAddress::Ethernet(SERVER_HW),
-                Instant::MAX,
+                at(0) + Duration::from_secs(24 * 60 * 60),
             )
             .unwrap();
 
