@@ -48,6 +48,11 @@ enum State {
         /// The timestamp past which the mapping should be discarded.
         expires_at: Instant,
     },
+    /// The mapping expired. Unlike RFC 4861's STALE, it isn't used to send: the
+    /// next packet for the neighbor resolves it again, which stands in for the
+    /// DELAY and PROBE states. Traffic from the neighbor, with the same hardware
+    /// address, makes it reachable again without that.
+    Stale { hardware_addr: HardwareAddress },
 }
 
 impl From<State> for NeighborState {
@@ -61,6 +66,7 @@ impl From<State> for NeighborState {
                 hardware_addr,
                 expires_at,
             },
+            State::Stale { hardware_addr } => NeighborState::Stale { hardware_addr },
         }
     }
 }
@@ -121,6 +127,15 @@ pub enum NeighborState {
         hardware_addr: HardwareAddress,
         /// When the entry expires. `Instant::MAX` means never.
         expires_at: Instant,
+    },
+    /// The entry expired. The stack no longer sends to this hardware address.
+    /// The next packet for the neighbor resolves it again.
+    ///
+    /// Traffic from the neighbor with the same hardware address makes the entry
+    /// reachable again.
+    Stale {
+        /// The neighbor's hardware address, when it was last known.
+        hardware_addr: HardwareAddress,
     },
 }
 
@@ -220,15 +235,23 @@ impl NeighborCache {
         None
     }
 
-    /// The earliest retransmission timer in the cache, or `Instant::MAX` if there is none.
-    pub(crate) fn poll_at(&self) -> Instant {
-        self.storage
-            .iter()
-            .filter_map(|(_, state)| match state {
-                State::Incomplete { retrans_at, .. } => Some(*retrans_at),
-                State::Reachable { .. } => None,
-            })
-            .fold(Instant::MAX, Instant::min)
+    /// Make the entries that expired stale, and count the retransmission timers
+    /// toward the next deadline. Every retransmission timer must be later than
+    /// now.
+    ///
+    /// An expiry doesn't count toward the deadline: nothing is due then, a lookup
+    /// checks it itself.
+    pub(crate) fn expire(&mut self, clock: &mut Clock) {
+        for (_, state) in self.storage.iter_mut() {
+            match *state {
+                State::Incomplete { retrans_at, .. } => clock.schedule(retrans_at),
+                State::Reachable {
+                    hardware_addr,
+                    expires_at,
+                } if expires_at <= clock.now() => *state = State::Stale { hardware_addr },
+                State::Reachable { .. } | State::Stale { .. } => {}
+            }
+        }
     }
 
     pub(crate) fn reset_expiry_if_existing(
@@ -237,13 +260,14 @@ impl NeighborCache {
         source_hardware_addr: HardwareAddress,
         timestamp: Instant,
     ) {
-        if let Some(State::Reachable {
-            hardware_addr,
-            expires_at,
-        }) = self.get_state_mut(&key)
-            && source_hardware_addr == *hardware_addr
+        if let Some(state) = self.get_state_mut(&key)
+            && let State::Reachable { hardware_addr, .. } | State::Stale { hardware_addr } = *state
+            && source_hardware_addr == hardware_addr
         {
-            *expires_at = timestamp + Self::ENTRY_LIFETIME;
+            *state = State::Reachable {
+                hardware_addr,
+                expires_at: timestamp + Self::ENTRY_LIFETIME,
+            };
         }
     }
 
@@ -260,13 +284,18 @@ impl NeighborCache {
         debug_assert!(hardware_addr.is_unicast());
 
         match self.get_state(&key) {
-            Some(State::Reachable {
-                hardware_addr: old_hardware_addr,
-                ..
-            }) if old_hardware_addr != hardware_addr => {
+            Some(
+                State::Reachable {
+                    hardware_addr: old_hardware_addr,
+                    ..
+                }
+                | State::Stale {
+                    hardware_addr: old_hardware_addr,
+                },
+            ) if old_hardware_addr != hardware_addr => {
                 trace!("replaced {} => {} (was {})", key.1, hardware_addr, old_hardware_addr);
             }
-            Some(State::Reachable { .. }) => {}
+            Some(State::Reachable { .. } | State::Stale { .. }) => {}
             Some(State::Incomplete { .. }) => {
                 trace!("filled {} => {} (was incomplete)", key.1, hardware_addr);
             }
@@ -286,8 +315,9 @@ impl NeighborCache {
 
     /// Get the entry for a neighbor.
     ///
-    /// Expired entries are still reported until the stack reuses their slot.
-    /// Compare `expires_at` against the current time if that matters.
+    /// An entry that expired is reported as [`NeighborState::Stale`] from the
+    /// next poll on, until the stack reuses its slot. Before that poll it is
+    /// still `Reachable`, with an `expires_at` that has passed.
     pub fn get(&self, iface: IfaceHandle, addr: IpAddr) -> Option<Neighbor> {
         let state = self.get_state(&(iface, addr))?;
         Some(Neighbor {
@@ -390,14 +420,15 @@ impl NeighborCache {
             *entry = state;
         } else if let Err((key, state)) = self.storage.push((key, state)) {
             // The cache is full, and we need to evict an entry. Prefer evicting
-            // resolved entries: evicting an in-progress resolution would strand the
-            // packets queued on it.
+            // stale entries, then resolved ones: evicting an in-progress resolution
+            // would strand the packets queued on it.
             let mut index = 0;
-            let mut best = (1u8, Instant::MAX);
+            let mut best = (u8::MAX, Instant::ZERO);
             for (i, (_, state)) in self.storage.iter().enumerate() {
                 let rank = match state {
-                    State::Reachable { expires_at, .. } => (0u8, *expires_at),
-                    State::Incomplete { retrans_at, .. } => (1u8, *retrans_at),
+                    State::Stale { .. } => (0u8, Instant::ZERO),
+                    State::Reachable { expires_at, .. } => (1u8, *expires_at),
+                    State::Incomplete { retrans_at, .. } => (2u8, *retrans_at),
                 };
                 if rank < best {
                     best = rank;
@@ -736,7 +767,7 @@ mod test {
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
         assert_eq!(cache.poll_retransmit(IF_0, t0, &mut 0), None);
-        assert_eq!(cache.poll_at(), t0 + RETRANS_TIMER);
+        assert_eq!(next_deadline(&mut cache, t0), t0 + RETRANS_TIMER);
 
         // Second and third probes.
         assert_eq!(
@@ -754,7 +785,8 @@ mod test {
             Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
         );
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::NotFound);
-        assert_eq!(cache.poll_at(), Instant::MAX);
+        let t3 = t0 + RETRANS_TIMER * 3;
+        assert_eq!(next_deadline(&mut cache, t3), Instant::MAX);
     }
 
     #[test]
@@ -769,8 +801,75 @@ mod test {
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Found(HADDR_A));
 
         // The resolved entry has no retransmission timer anymore.
-        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
-        assert_eq!(cache.poll_at(), Instant::MAX);
+        let t1 = t0 + RETRANS_TIMER;
+        assert_eq!(cache.poll_retransmit(IF_0, t1, &mut 0), None);
+        assert_eq!(next_deadline(&mut cache, t1), Instant::MAX);
+    }
+
+    /// A poll makes an expired entry stale. It isn't used to send, however long
+    /// ago it expired, and traffic from the neighbor makes it reachable again.
+    #[test]
+    fn test_expired_entry_goes_stale() {
+        let mut cache = NeighborCache::new();
+        cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::ZERO);
+        let entry = |cache: &NeighborCache| cache.get(IF_0, MOCK_IP_ADDR_1.into()).unwrap().state;
+
+        let expired = Instant::ZERO + NeighborCache::ENTRY_LIFETIME;
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), expired), Answer::NotFound);
+        next_deadline(&mut cache, expired);
+        assert_eq!(entry(&cache), NeighborState::Stale { hardware_addr: HADDR_A });
+
+        // Polled once a day for 100 days.
+        let mut now = expired;
+        for _ in 0..100 {
+            now += Duration::from_secs(24 * 60 * 60);
+            next_deadline(&mut cache, now);
+            assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::NotFound);
+        }
+        assert_eq!(entry(&cache), NeighborState::Stale { hardware_addr: HADDR_A });
+
+        // Traffic from another hardware address leaves it stale, traffic from
+        // the same one makes it reachable.
+        cache.reset_expiry_if_existing(key(MOCK_IP_ADDR_1), HADDR_B, now);
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::NotFound);
+        cache.reset_expiry_if_existing(key(MOCK_IP_ADDR_1), HADDR_A, now);
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::Found(HADDR_A));
+        assert_eq!(
+            entry(&cache),
+            NeighborState::Reachable {
+                hardware_addr: HADDR_A,
+                expires_at: now + NeighborCache::ENTRY_LIFETIME
+            }
+        );
+    }
+
+    /// A full cache evicts a stale entry before any other.
+    #[test]
+    fn test_evict_stale_first() {
+        let mut cache = NeighborCache::new();
+        cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::ZERO);
+        let later = Instant::ZERO + NeighborCache::ENTRY_LIFETIME;
+        next_deadline(&mut cache, later);
+        // The others are all reachable.
+        cache.fill(key(MOCK_IP_ADDR_2), HADDR_B, later);
+        for i in 0..(NEIGHBOR_CACHE_COUNT - 2) {
+            let mut addr = MOCK_IP_ADDR_3.octets();
+            addr[14] = 1;
+            addr[15] = i as u8;
+            cache.fill(key(Ipv6Addr::from(addr)), HADDR_C, later);
+        }
+
+        cache.fill(key(MOCK_IP_ADDR_4), HADDR_D, later);
+        assert!(cache.get(IF_0, MOCK_IP_ADDR_1.into()).is_none());
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_2), later), Answer::Found(HADDR_B));
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_4), later), Answer::Found(HADDR_D));
+    }
+
+    /// The deadline the cache counts in a poll at `now`.
+    fn next_deadline(cache: &mut NeighborCache, now: Instant) -> Instant {
+        let mut clock = Clock::new(now);
+        cache.expire(&mut clock);
+        clock.next()
     }
 
     #[test]

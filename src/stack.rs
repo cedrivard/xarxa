@@ -1210,7 +1210,7 @@ impl<'d> Stack<'d> {
         // due have been retransmitted, per interface, above.
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
-            clock.schedule(self.inner.neighbor_cache.poll_at());
+            self.inner.neighbor_cache.expire(&mut clock);
             // Drop queued packets whose neighbor resolution timed out.
             self.inner.pending.purge_expired(&mut clock);
         }
@@ -2346,7 +2346,8 @@ impl StackInner {
             }
             NeighborState::Reachable {
                 hardware_addr: cached, ..
-            } => {
+            }
+            | NeighborState::Stale { hardware_addr: cached } => {
                 let lladdr = lladdr.unwrap_or(cached);
                 if !flags.contains(NdiscNeighborFlags::OVERRIDE) && lladdr != cached {
                     // §7.2.5 I: the cache keeps its address.
@@ -7336,6 +7337,7 @@ pub(crate) mod test {
         {
             NeighborState::Reachable { expires_at, .. } => expires_at,
             NeighborState::Incomplete => panic!("incomplete"),
+            NeighborState::Stale { .. } => panic!("stale"),
         };
         let t0 = expires_at(&stack);
 
