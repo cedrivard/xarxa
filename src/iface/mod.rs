@@ -380,11 +380,9 @@ impl<'d> Iface<'_, 'd> {
         self.state_mut().hardware_addr = addr;
         #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         {
-            let ip_addrs = &mut self.state_mut().ip_addrs;
-            let had = ip_addrs.iter().any(|a| a.origin == AddrOrigin::LinkLocal);
-            ip_addrs.retain(|a| a.origin != AddrOrigin::LinkLocal);
+            let had = self.state_mut().remove_ip_addrs(AddrOrigin::LinkLocal);
             if let Some(ll) = link_local_addr(addr) {
-                if ip_addrs.push(ll).is_err() {
+                if self.state_mut().ip_addrs.push(ll).is_err() {
                     warn!("iface: address table full, link-local address not assigned");
                 }
                 self.invalidate();
@@ -821,6 +819,17 @@ impl IfaceState<'_> {
     /// The assigned addresses, without their origin.
     pub(crate) fn cidrs(&self) -> impl Iterator<Item = &IpCidr> + '_ {
         self.ip_addrs.iter().map(|a| &a.cidr)
+    }
+
+    /// Remove every address of the given origin, returning whether there was one.
+    #[cfg(any(
+        feature = "dhcpv4",
+        all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6")
+    ))]
+    pub(crate) fn remove_ip_addrs(&mut self, origin: AddrOrigin) -> bool {
+        let before = self.ip_addrs.len();
+        self.ip_addrs.retain(|a| a.origin != origin);
+        self.ip_addrs.len() != before
     }
 
     #[inline(never)] // helps code size

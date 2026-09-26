@@ -842,7 +842,7 @@ impl IfaceState<'_> {
         let old_addr = old.map(|l| IpCidr::V4(l.address));
         let new_addr = new.map(|l| IpCidr::V4(l.address));
         if old_addr != new_addr {
-            self.ip_addrs.retain(|a| a.origin != AddrOrigin::Dhcpv4);
+            self.remove_ip_addrs(AddrOrigin::Dhcpv4);
             if let Some(cidr) = new_addr {
                 let addr = IfaceAddr {
                     cidr,
@@ -860,9 +860,7 @@ impl IfaceState<'_> {
         let new_router = new.and_then(|l| l.router);
         if old_router != new_router {
             let handle = self.handle;
-            inner
-                .routes
-                .retain(|route| !(route.origin == RouteOrigin::Dhcpv4 && route.iface == handle));
+            inner.routes.remove_origin(handle, RouteOrigin::Dhcpv4);
             if let Some(new_router) = new_router {
                 let route = Route {
                     origin: RouteOrigin::Dhcpv4,

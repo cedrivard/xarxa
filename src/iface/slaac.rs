@@ -620,15 +620,10 @@ impl IfaceState<'_> {
         if self.slaac.take().is_none() {
             return;
         }
-        let before = self.ip_addrs.len();
-        self.ip_addrs.retain(|a| a.origin != AddrOrigin::Slaac);
-        if self.ip_addrs.len() != before {
+        if self.remove_ip_addrs(AddrOrigin::Slaac) {
             inner.purge_iface_link_state(self.handle);
         }
-        let handle = self.handle;
-        inner
-            .routes
-            .retain(|r| !(r.origin == RouteOrigin::Slaac && r.iface == handle));
+        inner.routes.remove_origin(self.handle, RouteOrigin::Slaac);
         self.config_changed();
     }
 }

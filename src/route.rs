@@ -318,6 +318,13 @@ impl Routes {
         }
     }
 
+    /// Remove all routes of the given origin that go out of the given interface.
+    #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+    pub(crate) fn remove_origin(&mut self, iface: IfaceHandle, origin: RouteOrigin) {
+        self.storage
+            .retain(|route| !(route.origin == origin && route.iface == iface));
+    }
+
     /// Remove all routes that go out of the given interface.
     pub(crate) fn purge_iface(&mut self, iface: IfaceHandle) {
         self.storage.retain(|route| route.iface != iface);
