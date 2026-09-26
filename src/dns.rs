@@ -433,7 +433,7 @@ impl DnsClient {
                         break;
                     }
 
-                    match eq_names(p.parse_name(question.name), p.parse_name(&pq.name)) {
+                    match name_eq(&p, question.name, &pq.name) {
                         Ok(true) => {}
                         Ok(false) => {
                             trace!("question name mismatch");
@@ -457,7 +457,7 @@ impl DnsClient {
                         };
                         payload = payload2;
 
-                        match eq_names(p.parse_name(r.name), p.parse_name(&pq.name)) {
+                        match name_eq(&p, r.name, &pq.name) {
                             Ok(true) => {}
                             Ok(false) => {
                                 trace!("answer name mismatch: {:?}", r);
@@ -636,31 +636,19 @@ impl DnsClient {
     }
 }
 
-fn eq_names<'a>(
-    mut a: impl Iterator<Item = Result<&'a [u8], Malformed>>,
-    mut b: impl Iterator<Item = Result<&'a [u8], Malformed>>,
-) -> Result<bool, Malformed> {
-    loop {
-        match (a.next(), b.next()) {
-            // Handle errors
-            (Some(Err(e)), _) => return Err(e),
-            (_, Some(Err(e))) => return Err(e),
-
-            // Both finished -> equal
-            (None, None) => return Ok(true),
-
-            // One finished before the other -> not equal
-            (None, _) => return Ok(false),
-            (_, None) => return Ok(false),
-
-            // Got two labels, check if they're equal
-            (Some(Ok(la)), Some(Ok(lb))) => {
-                if la != lb {
-                    return Ok(false);
-                }
+/// Whether the name at `name` in `p` is `flat`, a name in wire format with no
+/// compression pointers.
+fn name_eq(p: &Packet<'_>, name: &[u8], mut flat: &[u8]) -> Result<bool, Malformed> {
+    for label in p.parse_name(name) {
+        let label = label?;
+        match flat.split_first() {
+            Some((&len, rest)) if len as usize == label.len() && rest.get(..label.len()) == Some(label) => {
+                flat = &rest[label.len()..];
             }
+            _ => return Ok(false),
         }
     }
+    Ok(flat.first() == Some(&0))
 }
 
 fn copy_name<'a, const N: usize>(
