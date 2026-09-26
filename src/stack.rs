@@ -1368,7 +1368,7 @@ impl<'d> Stack<'d> {
         #[cfg(feature = "dhcpv4-server")]
         if next_header == IpProtocol::Udp && self.ifaces.get(iface.index()).dhcpv4_server.is_some() {
             let iface_state = self.ifaces.get(iface.index());
-            let for_us = iface_state.is_broadcast_v4(dst_addr) || iface_state.has_ip_addr(dst_addr);
+            let for_us = iface_state.is_broadcast_v4(dst_addr) || iface_state.has_ip_addr(dst_addr.into());
             let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
                 Some(Ok(udp)) if for_us && udp.dst_port() == DHCP_SERVER_PORT => {
                     if !checksum_caps.udp.rx && !udp.verify_checksum(&IpAddr::V4(src_addr), &IpAddr::V4(dst_addr)) {
@@ -1396,7 +1396,9 @@ impl<'d> Stack<'d> {
                 return;
             }
 
-            if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !iface.is_broadcast_v4(dst_addr)
+            if !iface.has_ip_addr(dst_addr.into())
+                && !iface.has_multicast_group(dst_addr)
+                && !iface.is_broadcast_v4(dst_addr)
             {
                 // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
                 trace!("Rejecting IPv4 packet; not for us");
@@ -1705,7 +1707,7 @@ impl<'d> Stack<'d> {
 
         {
             let iface = self.ifaces.get(iface.index());
-            if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
+            if !iface.has_ip_addr(dst_addr.into()) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
                 trace!("Rejecting IPv6 packet; not for us");
                 return;
             }
@@ -2190,7 +2192,7 @@ impl StackInner {
         let target_protocol_addr = Ipv4Addr::from(<[u8; 4]>::try_from(arp_packet.target_protocol_addr()).unwrap());
 
         // Only process ARP packets for us.
-        if !iface.has_ip_addr(target_protocol_addr) {
+        if !iface.has_ip_addr(target_protocol_addr.into()) {
             return;
         }
 
@@ -2274,7 +2276,9 @@ impl StackInner {
         // RFC 4861 §7.2.3: the destination is either the target's solicited-node
         // multicast (address resolution) or one of our unicast addresses (a
         // unicast NUD probe). Answer both.
-        if (iface.has_solicited_node(dst_addr) || iface.has_ip_addr(dst_addr)) && iface.has_ip_addr(target_addr) {
+        if (iface.has_solicited_node(dst_addr) || iface.has_ip_addr(dst_addr.into()))
+            && iface.has_ip_addr(target_addr.into())
+        {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option.
 

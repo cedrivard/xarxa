@@ -402,7 +402,7 @@ impl<'d> Iface<'_, 'd> {
 
     /// Check whether the given address is assigned to the interface.
     pub fn has_ip_addr(&self, addr: impl Into<IpAddr>) -> bool {
-        self.state().has_ip_addr(addr)
+        self.state().has_ip_addr(addr.into())
     }
 
     /// Assign an IP address to the interface.
@@ -824,8 +824,7 @@ impl IfaceState<'_> {
     }
 
     #[inline(never)] // helps code size
-    pub(crate) fn has_ip_addr(&self, addr: impl Into<IpAddr>) -> bool {
-        let addr = addr.into();
+    pub(crate) fn has_ip_addr(&self, addr: IpAddr) -> bool {
         self.cidrs().any(|probe| probe.address() == addr)
     }
 

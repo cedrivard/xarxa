@@ -596,7 +596,7 @@ impl IfaceState<'_> {
             Duration::ZERO
         };
         // General query
-        if mcast_addr.is_unspecified() && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_ip_addr(dst_addr)) {
+        if mcast_addr.is_unspecified() && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_ip_addr(dst_addr.into())) {
             let ipv6_multicast_group_count = self.multicast.keys().filter(|a| matches!(a, IpAddr::V6(_))).count();
             if ipv6_multicast_group_count != 0 {
                 self.multicast.mld_report_state = MldReportState::ToGeneralQuery { timeout: now + delay };
