@@ -618,22 +618,31 @@ impl IfaceState<'_> {
         &self,
         records: impl Iterator<Item = (MldRecordType, Ipv6Addr)> + Clone,
     ) -> Option<PacketBuf> {
-        // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
-        // back to the unspecified address if we haven't acquired one.
-        // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
+        let (mut pkt, record_count) = self.mldv2_report_start(records.clone().count())?;
+        let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
+        let mut payload = mld.payload_mut();
+        for (record_type, mcast_addr) in records.take(record_count) {
+            let mut record = MldAddressRecord::new_unchecked(&mut payload[..MLD_ADDRESS_RECORD_LEN]);
+            record.set_record_type(record_type);
+            record.set_aux_data_len(0);
+            record.set_num_srcs(0);
+            record.set_mcast_addr(mcast_addr);
+            payload = &mut payload[MLD_ADDRESS_RECORD_LEN..];
+        }
+        self.mldv2_report_finish(&mut pkt);
+        Some(pkt)
+    }
 
+    /// Allocate an MLDv2 report for `record_count` address records, and write its
+    /// header. Returns the report and how many records fit in it.
+    #[cfg(feature = "ipv6")]
+    fn mldv2_report_start(&self, record_count: usize) -> Option<(PacketBuf, usize)> {
         use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-        let src_addr = self.link_local_ipv6_address().unwrap_or(Ipv6Addr::UNSPECIFIED);
-
-        // Per [RFC 3810 § 5.2.14], all MLDv2 reports are sent to ff02::16.
-        // [RFC 3810 § 5.2.14]: https://tools.ietf.org/html/rfc3810#section-5.2.14
-        let dst_addr = IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS;
 
         // MLD report: the report header (8 bytes) plus one record per group.
         let mut pkt = PacketBuf::try_new()?;
         pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
-        let record_count = records.clone().count();
         if record_count > max_records {
             warn!(
                 "mld: {} groups don't fit in one report, reporting {}",
@@ -641,34 +650,38 @@ impl IfaceState<'_> {
             );
         }
         let record_count = record_count.min(max_records);
-        let records = records.take(record_count);
         pkt.set_len(8 + record_count * MLD_ADDRESS_RECORD_LEN);
-        {
-            let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
-            mld.set_msg_type(Icmpv6Message::MldReport);
-            mld.set_msg_code(0);
-            mld.clear_reserved();
-            mld.set_nr_mcast_addr_rcrds(record_count as u16);
-            let mut payload = mld.payload_mut();
-            for (record_type, mcast_addr) in records {
-                let mut record = MldAddressRecord::new_unchecked(&mut payload[..MLD_ADDRESS_RECORD_LEN]);
-                record.set_record_type(record_type);
-                record.set_aux_data_len(0);
-                record.set_num_srcs(0);
-                record.set_mcast_addr(mcast_addr);
-                payload = &mut payload[MLD_ADDRESS_RECORD_LEN..];
-            }
-            if !self.checksum_caps().icmpv6.tx {
-                mld.fill_checksum(&src_addr, &dst_addr);
-            } else {
-                mld.set_checksum(0);
-            }
+        let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
+        mld.set_msg_type(Icmpv6Message::MldReport);
+        mld.set_msg_code(0);
+        mld.clear_reserved();
+        mld.set_nr_mcast_addr_rcrds(record_count as u16);
+        Some((pkt, record_count))
+    }
+
+    /// Checksum an MLDv2 report with its records written, and put the IPv6 headers
+    /// in front of it.
+    #[cfg(feature = "ipv6")]
+    fn mldv2_report_finish(&self, pkt: &mut PacketBuf) {
+        // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
+        // back to the unspecified address if we haven't acquired one.
+        // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
+        let src_addr = self.link_local_ipv6_address().unwrap_or(Ipv6Addr::UNSPECIFIED);
+
+        // Per [RFC 3810 § 5.2.14], all MLDv2 reports are sent to ff02::16.
+        // [RFC 3810 § 5.2.14]: https://tools.ietf.org/html/rfc3810#section-5.2.14
+        let dst_addr = IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS;
+
+        let mut mld = Icmpv6Packet::new_unchecked(pkt);
+        if !self.checksum_caps().icmpv6.tx {
+            mld.fill_checksum(&src_addr, &dst_addr);
+        } else {
+            mld.set_checksum(0);
         }
-        push_mldv2_router_alert(&mut pkt);
+        push_mldv2_router_alert(pkt);
 
         // All MLDv2 messages must be sent with an IPv6 Hop limit of 1.
-        crate::stack::push_ipv6_header(&mut pkt, src_addr, dst_addr, IpProtocol::HopByHop, 1);
-        Some(pkt)
+        crate::stack::push_ipv6_header(pkt, src_addr, dst_addr, IpProtocol::HopByHop, 1);
     }
 }
 
