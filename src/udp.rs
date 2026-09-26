@@ -772,6 +772,12 @@ impl UdpSocket<'_, '_> {
     ///
     /// See [send_with](#method.send_with).
     pub fn send_slice(&mut self, data: &[u8], meta: impl Into<UdpMetadata>) -> Result<(), SendError> {
+        self.send_slice_meta(data, meta.into())
+    }
+
+    /// [`send_slice`](Self::send_slice), with the metadata converted, so that
+    /// only the conversion is compiled per metadata type.
+    fn send_slice_meta(&mut self, data: &[u8], meta: UdpMetadata) -> Result<(), SendError> {
         self.send_with(data.len(), meta, |buf| {
             buf.copy_from_slice(data);
             data.len()
