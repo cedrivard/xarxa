@@ -19,7 +19,7 @@ use crate::driver::PacketMeta;
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
-use crate::stack::{IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -811,7 +811,21 @@ impl UdpSocket<'_, '_> {
         meta: impl Into<UdpMetadata>,
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
-        let mut meta = meta.into();
+        let (mut buf, egress) = self.prepare_datagram(max_size, meta.into())?;
+        let size = f(&mut buf);
+        assert!(size <= max_size);
+        buf.set_len(size);
+        self.transmit_datagram(egress, buf);
+        Ok(())
+    }
+
+    /// Check and route a datagram to send, and allocate its packet buffer, with
+    /// headroom for the headers below and `max_size` bytes for the payload.
+    fn prepare_datagram(
+        &mut self,
+        max_size: usize,
+        mut meta: UdpMetadata,
+    ) -> Result<(PacketBuf, DatagramEgress), SendError> {
         let (local, remote, binding, hop_limit) = {
             let socket = self.inner();
             (
@@ -878,8 +892,7 @@ impl UdpSocket<'_, '_> {
             return Err(SendError::Unaddressable);
         }
 
-        // Build the datagram: reserve headroom for the headers below, write the
-        // payload, prepend the UDP header.
+        // Reserve headroom for the headers below, and room for the payload.
         let ip_header_len = match meta.remote_addr.addr {
             #[cfg(feature = "ipv4")]
             IpAddr::V4(_) => IPV4_HEADER_LEN,
@@ -905,19 +918,33 @@ impl UdpSocket<'_, '_> {
         buf.set_meta(meta.meta);
         buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(max_size);
-        let size = f(&mut buf);
-        assert!(size <= max_size);
-        buf.set_len(size);
 
+        let egress = DatagramEgress {
+            route,
+            src: SocketAddr::new(src_addr, local.port),
+            dst: meta.remote_addr,
+            hop_limit,
+        };
+        Ok((buf, egress))
+    }
+
+    /// Prepend the UDP header to a datagram's payload and send it.
+    fn transmit_datagram(&mut self, egress: DatagramEgress, mut buf: PacketBuf) {
+        let DatagramEgress {
+            route,
+            src,
+            dst,
+            hop_limit,
+        } = egress;
+        let size = buf.len();
         buf.push_front(UDP_HEADER_LEN);
-        let udp_len = buf.len();
         {
             let mut udp = UdpPacket::new_unchecked(&mut buf);
-            udp.set_src_port(local.port);
-            udp.set_dst_port(meta.remote_addr.port);
-            udp.set_len(udp_len as u16);
+            udp.set_src_port(src.port);
+            udp.set_dst_port(dst.port);
+            udp.set_len((size + UDP_HEADER_LEN) as u16);
             if !self.tx.checksum_caps(route.iface).udp.tx {
-                udp.fill_checksum(&src_addr, &meta.remote_addr.addr);
+                udp.fill_checksum(&src.addr, &dst.addr);
             } else {
                 // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
                 // device that computes it itself expects to find in the field.
@@ -925,12 +952,19 @@ impl UdpSocket<'_, '_> {
             }
         }
 
-        trace!("udp:{}:{}: sending {} octets", local, meta.remote_addr, size);
+        trace!("udp:{}:{}: sending {} octets", src, dst, size);
 
         self.tx
-            .transmit_ip(&route, buf, src_addr, meta.remote_addr.addr, IpProtocol::Udp, hop_limit);
-        Ok(())
+            .transmit_ip(&route, buf, src.addr, dst.addr, IpProtocol::Udp, hop_limit);
     }
+}
+
+/// Where a datagram goes, worked out before its payload is written.
+struct DatagramEgress {
+    route: EgressRoute,
+    src: SocketAddr,
+    dst: SocketAddr,
+    hop_limit: u8,
 }
 
 impl Stack<'_> {
