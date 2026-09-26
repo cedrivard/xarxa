@@ -953,9 +953,7 @@ impl IfaceState<'_> {
     }
 
     /// Check whether the interface listens to given destination multicast IP address.
-    pub(crate) fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
-        let addr = addr.into();
-
+    pub(crate) fn has_multicast_group(&self, addr: IpAddr) -> bool {
         #[cfg(feature = "multicast")]
         if self.multicast.has_multicast_group(addr) {
             return true;

@@ -84,10 +84,10 @@ impl State {
         }
     }
 
-    pub(crate) fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
+    pub(crate) fn has_multicast_group(&self, addr: IpAddr) -> bool {
         // Return false if we don't have the multicast group,
         // or we're leaving it.
-        match self.get(&addr.into()) {
+        match self.get(&addr) {
             None => false,
             Some(GroupState::Joining) => true,
             Some(GroupState::Joined) => true,
@@ -155,7 +155,7 @@ impl Iface<'_, '_> {
     /// # Errors
     /// - `Unaddressable`: if the address is not a multicast address.
     pub fn join_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        let res = self.state_mut().join_multicast_group(addr);
+        let res = self.state_mut().join_multicast_group(addr.into());
         #[cfg(feature = "medium-ethernet")]
         self.state_mut().sync_multicast_filter();
         res
@@ -171,7 +171,7 @@ impl Iface<'_, '_> {
     /// # Errors
     /// - `Unaddressable`: if the address is not a multicast address.
     pub fn leave_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        let res = self.state_mut().leave_multicast_group(addr);
+        let res = self.state_mut().leave_multicast_group(addr.into());
         #[cfg(feature = "medium-ethernet")]
         self.state_mut().sync_multicast_filter();
         res
@@ -183,14 +183,13 @@ impl Iface<'_, '_> {
     /// member of: the IPv4 all systems group, the IPv6 all nodes group, and the
     /// IPv6 solicited node group of each address assigned to the interface.
     pub fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
-        self.state().has_multicast_group(addr)
+        self.state().has_multicast_group(addr.into())
     }
 }
 
 impl IfaceState<'_> {
     /// Add an address to a list of subscribed multicast IP addresses.
-    pub(crate) fn join_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        let addr = addr.into();
+    pub(crate) fn join_multicast_group(&mut self, addr: IpAddr) -> Result<(), MulticastError> {
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
         }
@@ -210,8 +209,7 @@ impl IfaceState<'_> {
     }
 
     /// Remove an address from the subscribed multicast IP addresses.
-    pub(crate) fn leave_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
-        let addr = addr.into();
+    pub(crate) fn leave_multicast_group(&mut self, addr: IpAddr) -> Result<(), MulticastError> {
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
         }
@@ -254,7 +252,7 @@ impl IfaceState<'_> {
         for i in 0..self.ip_addrs.len() {
             #[allow(irrefutable_let_patterns)]
             if let IpCidr::V6(cidr) = self.ip_addrs[i].cidr {
-                let _ = self.join_multicast_group(cidr.address().solicited_node());
+                let _ = self.join_multicast_group(cidr.address().solicited_node().into());
             }
         }
     }
@@ -477,7 +475,7 @@ impl IfaceState<'_> {
                     }
                 } else {
                     // Group-specific query
-                    if self.has_multicast_group(group_addr) && dst_addr == group_addr {
+                    if self.has_multicast_group(group_addr.into()) && dst_addr == group_addr {
                         // Don't respond immediately
                         let timeout = max_resp_time / 4;
                         self.multicast.igmp_report_state = IgmpReportState::ToSpecificQuery {
@@ -591,7 +589,7 @@ impl IfaceState<'_> {
                 self.multicast.mld_report_state = MldReportState::ToGeneralQuery { timeout: now + delay };
             }
         }
-        if self.has_multicast_group(mcast_addr) && dst_addr == mcast_addr {
+        if self.has_multicast_group(mcast_addr.into()) && dst_addr == mcast_addr {
             self.multicast.mld_report_state = MldReportState::ToSpecificQuery {
                 group: mcast_addr,
                 timeout: now + delay,

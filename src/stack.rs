@@ -1397,7 +1397,7 @@ impl<'d> Stack<'d> {
             }
 
             if !iface.has_ip_addr(dst_addr.into())
-                && !iface.has_multicast_group(dst_addr)
+                && !iface.has_multicast_group(dst_addr.into())
                 && !iface.is_broadcast_v4(dst_addr)
             {
                 // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
@@ -1707,7 +1707,10 @@ impl<'d> Stack<'d> {
 
         {
             let iface = self.ifaces.get(iface.index());
-            if !iface.has_ip_addr(dst_addr.into()) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
+            if !iface.has_ip_addr(dst_addr.into())
+                && !iface.has_multicast_group(dst_addr.into())
+                && !dst_addr.is_loopback()
+            {
                 trace!("Rejecting IPv6 packet; not for us");
                 return;
             }
