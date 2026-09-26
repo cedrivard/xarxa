@@ -1984,11 +1984,7 @@ impl<'d> TcpSocketState<'d> {
             // aborting a connection, forget about it after sending a single RST packet.
             State::Closed => {
                 let offset = self.flight_size();
-                let rst = TcpRepr {
-                    control: TcpControl::Rst,
-                    ..repr
-                };
-                self.send_segment(clock, &mut send, rst, offset, 0)?;
+                self.send_segment(clock, &mut send, &repr, TcpControl::Rst, offset, 0)?;
                 self.tuple = None;
                 // Wake tx now so that async users can wait for the RST to be sent.
                 #[cfg(feature = "async")]
@@ -2002,7 +1998,6 @@ impl<'d> TcpSocketState<'d> {
             State::SynSent | State::SynReceived => {
                 if self.remote_last_seq == self.local_seq_no || self.ack_due(clock) {
                     let mut syn = TcpRepr {
-                        control: TcpControl::Syn,
                         // window len must NOT be scaled in SYNs.
                         window_len: u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX),
                         max_seg_size: Some(local_mss as u16),
@@ -2022,7 +2017,7 @@ impl<'d> TcpSocketState<'d> {
                         }
                         syn.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
                     }
-                    self.send_segment(clock, &mut send, syn, 0, 0)?;
+                    self.send_segment(clock, &mut send, &syn, TcpControl::Syn, 0, 0)?;
                 }
             }
 
@@ -2040,7 +2035,7 @@ impl<'d> TcpSocketState<'d> {
                 if self.pending_fast_retransmit && tx_len != 0 {
                     let len = mss.min(tx_len);
                     let control = data_control(0, len);
-                    self.send_segment(clock, &mut send, TcpRepr { control, ..repr }, 0, len)?;
+                    self.send_segment(clock, &mut send, &repr, control, 0, len)?;
                     self.pending_fast_retransmit = false;
                 }
 
@@ -2061,7 +2056,7 @@ impl<'d> TcpSocketState<'d> {
                     if len < mss && self.nagle && offset != 0 && !want_fin && !self.ack_due(clock) {
                         break;
                     }
-                    self.send_segment(clock, &mut send, TcpRepr { control, ..repr }, offset, len)?;
+                    self.send_segment(clock, &mut send, &repr, control, offset, len)?;
                 }
             }
 
@@ -2096,7 +2091,7 @@ impl<'d> TcpSocketState<'d> {
         // An ACK or a window update is due, and nothing sent above carried it.
         if self.ack_due(clock) {
             let offset = self.flight_size();
-            self.send_segment(clock, &mut send, repr, offset, 0)?;
+            self.send_segment(clock, &mut send, &repr, TcpControl::None, offset, 0)?;
         }
 
         match self.timer {
@@ -2145,14 +2140,16 @@ impl<'d> TcpSocketState<'d> {
         Ok(())
     }
 
-    /// Send one segment: `repr`, with the `len` octets of the transmit buffer at
-    /// `offset` as its payload, and that offset's sequence number. Once it's sent,
+    /// Send one segment: `repr` with the `control` flag, with the `len` octets of
+    /// the transmit buffer at `offset` as its payload, and that offset's sequence
+    /// number. Once it's sent,
     /// record what it acknowledged, advertised and took up in sequence space.
     fn send_segment<E>(
         &mut self,
         clock: &mut Clock,
         send: &mut impl FnMut(TcpRepr) -> Result<(), E>,
-        repr: TcpRepr<'static>,
+        repr: &TcpRepr<'static>,
+        control: TcpControl,
         offset: usize,
         len: usize,
     ) -> Result<(), E> {
@@ -2165,10 +2162,11 @@ impl<'d> TcpSocketState<'d> {
             .tx_buffer
             .get_allocated(offset + payload.len(), len - payload.len());
         let repr = TcpRepr {
+            control,
             seq_number: self.local_seq_no + offset,
             payload,
             payload2,
-            ..repr
+            ..*repr
         };
 
         // Trace a summary of what will be sent.
