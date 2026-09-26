@@ -472,7 +472,9 @@ pub enum TcpOption<'a> {
     MaxSegmentSize(u16),
     WindowScale(u8),
     SackPermitted,
-    SackRange([Option<(u32, u32)>; 3]),
+    /// SACK blocks (RFC 2018), 8 bytes each: the left and the right edge, in
+    /// network byte order.
+    SackRange(&'a [u8]),
     #[cfg(feature = "tcp-timestamps")]
     TimeStamp {
         tsval: u32,
@@ -511,36 +513,7 @@ impl<'a> TcpOption<'a> {
                         if n < 10 || (n - 2) % 8 != 0 {
                             return Err(Malformed);
                         }
-                        if n > 26 {
-                            // It's possible for a remote to send 4 SACK blocks, but extremely rare.
-                            // Better to "lose" that 4th block and save the extra RAM and CPU
-                            // cycles in the vastly more common case.
-                            //
-                            // RFC 2018: SACK option that specifies n blocks will have a length of
-                            // 8*n+2 bytes, so the 40 bytes available for TCP options can specify a
-                            // maximum of 4 blocks.  It is expected that SACK will often be used in
-                            // conjunction with the Timestamp option used for RTTM [...] thus a
-                            // maximum of 3 SACK blocks will be allowed in this case.
-                            debug!("sACK with >3 blocks, truncating to 3");
-                        }
-                        let mut sack_ranges: [Option<(u32, u32)>; 3] = [None; 3];
-
-                        // RFC 2018: Each contiguous block of data queued at the data receiver is
-                        // defined in the SACK option by two 32-bit unsigned integers in network
-                        // byte order[...]
-                        sack_ranges.iter_mut().enumerate().for_each(|(i, nmut)| {
-                            let left = i * 8;
-                            *nmut = if left < data.len() {
-                                let mid = left + 4;
-                                let right = mid + 4;
-                                let range_left = NetworkEndian::read_u32(&data[left..mid]);
-                                let range_right = NetworkEndian::read_u32(&data[mid..right]);
-                                Some((range_left, range_right))
-                            } else {
-                                None
-                            };
-                        });
-                        option = TcpOption::SackRange(sack_ranges);
+                        option = TcpOption::SackRange(data);
                     }
                     #[cfg(feature = "tcp-timestamps")]
                     (field::OPT_TSTAMP, 10) => {
@@ -562,7 +535,7 @@ impl<'a> TcpOption<'a> {
             TcpOption::MaxSegmentSize(_) => 4,
             TcpOption::WindowScale(_) => 3,
             TcpOption::SackPermitted => 2,
-            TcpOption::SackRange(s) => s.iter().filter(|s| s.is_some()).count() * 8 + 2,
+            TcpOption::SackRange(blocks) => 2 + blocks.len(),
             #[cfg(feature = "tcp-timestamps")]
             TcpOption::TimeStamp { tsval: _, tsecr: _ } => 10,
             TcpOption::Unknown { data, .. } => 2 + data.len(),
@@ -599,14 +572,9 @@ impl<'a> TcpOption<'a> {
                     &TcpOption::SackPermitted => {
                         buffer[0] = field::OPT_SACKPERM;
                     }
-                    &TcpOption::SackRange(slice) => {
+                    &TcpOption::SackRange(blocks) => {
                         buffer[0] = field::OPT_SACKRNG;
-                        slice.iter().filter(|s| s.is_some()).enumerate().for_each(|(i, s)| {
-                            let (first, second) = *s.as_ref().unwrap();
-                            let pos = i * 8 + 2;
-                            NetworkEndian::write_u32(&mut buffer[pos..], first);
-                            NetworkEndian::write_u32(&mut buffer[pos + 4..], second);
-                        });
+                        buffer[2..length].copy_from_slice(blocks);
                     }
                     #[cfg(feature = "tcp-timestamps")]
                     &TcpOption::TimeStamp { tsval, tsecr } => {
@@ -752,21 +720,22 @@ mod test {
         assert_option_parses!(TcpOption::WindowScale(12), &[0x03, 0x03, 0x0c]);
         assert_option_parses!(TcpOption::SackPermitted, &[0x4, 0x02]);
         assert_option_parses!(
-            TcpOption::SackRange([Some((500, 1500)), None, None]),
+            TcpOption::SackRange(&[0x00, 0x00, 0x01, 0xf4, 0x00, 0x00, 0x05, 0xdc]),
             &[0x05, 0x0a, 0x00, 0x00, 0x01, 0xf4, 0x00, 0x00, 0x05, 0xdc]
         );
         assert_option_parses!(
-            TcpOption::SackRange([Some((875, 1225)), Some((1500, 2500)), None]),
+            TcpOption::SackRange(&[
+                0x00, 0x00, 0x03, 0x6b, 0x00, 0x00, 0x04, 0xc9, 0x00, 0x00, 0x05, 0xdc, 0x00, 0x00, 0x09, 0xc4
+            ]),
             &[
                 0x05, 0x12, 0x00, 0x00, 0x03, 0x6b, 0x00, 0x00, 0x04, 0xc9, 0x00, 0x00, 0x05, 0xdc, 0x00, 0x00, 0x09,
                 0xc4
             ]
         );
         assert_option_parses!(
-            TcpOption::SackRange([
-                Some((875000, 1225000)),
-                Some((1500000, 2500000)),
-                Some((876543210, 876654320))
+            TcpOption::SackRange(&[
+                0x00, 0x0d, 0x59, 0xf8, 0x00, 0x12, 0xb1, 0x28, 0x00, 0x16, 0xe3, 0x60, 0x00, 0x26, 0x25, 0xa0, 0x34,
+                0x3e, 0xfc, 0xea, 0x34, 0x40, 0xae, 0xf0
             ]),
             &[
                 0x05, 0x1a, 0x00, 0x0d, 0x59, 0xf8, 0x00, 0x12, 0xb1, 0x28, 0x00, 0x16, 0xe3, 0x60, 0x00, 0x26, 0x25,

@@ -7,6 +7,9 @@
 
 use core::fmt;
 
+#[cfg(feature = "tcp-sack")]
+use byteorder::{ByteOrder, NetworkEndian};
+
 use crate::driver::ChecksumCapabilities;
 use crate::error::Malformed;
 use crate::wire::{IpAddr, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
@@ -93,8 +96,6 @@ impl<'a> TcpRepr<'a> {
         let mut options = packet.options();
         #[cfg(feature = "tcp-sack")]
         let mut sack_permitted = false;
-        #[cfg(feature = "tcp-sack")]
-        let mut sack_ranges = [None, None, None];
         #[cfg(feature = "tcp-timestamps")]
         let mut timestamp = None;
         while !options.is_empty() {
@@ -123,8 +124,6 @@ impl<'a> TcpRepr<'a> {
                 }
                 #[cfg(feature = "tcp-sack")]
                 TcpOption::SackPermitted => sack_permitted = true,
-                #[cfg(feature = "tcp-sack")]
-                TcpOption::SackRange(slice) => sack_ranges = slice,
                 #[cfg(feature = "tcp-timestamps")]
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
@@ -145,8 +144,9 @@ impl<'a> TcpRepr<'a> {
             max_seg_size,
             #[cfg(feature = "tcp-sack")]
             sack_permitted,
+            // The socket only sends SACK blocks. It doesn't act on the ones it receives.
             #[cfg(feature = "tcp-sack")]
-            sack_ranges,
+            sack_ranges: [None, None, None],
             #[cfg(feature = "tcp-timestamps")]
             timestamp,
             payload: packet.payload(),
@@ -238,8 +238,15 @@ impl<'a> TcpRepr<'a> {
                 let tmp = options;
                 options = TcpOption::SackPermitted.emit(tmp);
             } else if self.ack_number.is_some() && self.sack_ranges.iter().any(|s| s.is_some()) {
+                let mut blocks = [0; 24];
+                let mut len = 0;
+                for &(left, right) in self.sack_ranges.iter().flatten() {
+                    NetworkEndian::write_u32(&mut blocks[len..], left);
+                    NetworkEndian::write_u32(&mut blocks[len + 4..], right);
+                    len += 8;
+                }
                 let tmp = options;
-                options = TcpOption::SackRange(self.sack_ranges).emit(tmp);
+                options = TcpOption::SackRange(&blocks[..len]).emit(tmp);
             }
             #[cfg(feature = "tcp-timestamps")]
             if let Some(timestamp) = self.timestamp {
