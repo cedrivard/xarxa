@@ -265,65 +265,54 @@ impl IfaceState<'_> {
     /// - Depending on `igmp_report_state` and the therein contained
     ///   timeouts, send IGMP membership reports.
     pub(crate) fn multicast_egress(&mut self, inner: &mut StackInner, clock: &mut Clock) {
-        // IPv4 reports need an address. Keep joins pending across DHCP restart.
+        // Send the pending joins and leaves, in one pass over the groups. IPv4
+        // reports need an address. Keep joins pending across DHCP restart.
         #[cfg(feature = "ipv4")]
         let has_ipv4_addr = self.ipv4_addr().is_some();
-        while let Some(&(addr, _)) = self.multicast.groups.iter().find(|&&(addr, state)| {
-            state == GroupState::Joining
-                && match addr {
-                    #[cfg(feature = "ipv4")]
-                    IpAddr::V4(_) => has_ipv4_addr,
-                    #[cfg(feature = "ipv6")]
-                    IpAddr::V6(_) => true,
-                }
-        }) {
-            match addr {
-                #[cfg(feature = "ipv4")]
-                IpAddr::V4(addr) => {
-                    if let Some(pkt) = self.igmp_report_packet(IgmpVersion::Version2, addr) {
+        let mut i = 0;
+        while let Some(&(addr, state)) = self.multicast.groups.get(i) {
+            match state {
+                GroupState::Joining
+                    if match addr {
+                        #[cfg(feature = "ipv4")]
+                        IpAddr::V4(_) => has_ipv4_addr,
+                        #[cfg(feature = "ipv6")]
+                        IpAddr::V6(_) => true,
+                    } =>
+                {
+                    let pkt = match addr {
+                        #[cfg(feature = "ipv4")]
+                        IpAddr::V4(addr) => self.igmp_report_packet(IgmpVersion::Version2, addr),
+                        // An empty EXCLUDE list accepts every source.
+                        #[cfg(feature = "ipv6")]
+                        IpAddr::V6(addr) => {
+                            self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToExclude, addr)))
+                        }
+                    };
+                    if let Some(pkt) = pkt {
                         self.dispatch_ip(inner, pkt);
                     }
+                    self.multicast.groups[i].1 = GroupState::Joined;
+                    i += 1;
                 }
-                #[cfg(feature = "ipv6")]
-                IpAddr::V6(addr) => {
-                    // An empty EXCLUDE list accepts every source; empty INCLUDE leaves.
-                    if let Some(pkt) =
-                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToExclude, addr)))
-                    {
+                GroupState::Leaving => {
+                    let pkt = match addr {
+                        #[cfg(feature = "ipv4")]
+                        IpAddr::V4(addr) => self.igmp_leave_packet(addr),
+                        // An empty INCLUDE list leaves.
+                        #[cfg(feature = "ipv6")]
+                        IpAddr::V6(addr) => {
+                            self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToInclude, addr)))
+                        }
+                    };
+                    if let Some(pkt) = pkt {
                         self.dispatch_ip(inner, pkt);
                     }
+                    // The last group moves into this slot, and is looked at next.
+                    self.multicast.groups.swap_remove(i);
                 }
+                _ => i += 1,
             }
-
-            // NOTE: this is always replacing an existing entry, so it can't fail.
-            let _ = self.multicast.insert(addr, GroupState::Joined);
-        }
-
-        // Process multicast leaves.
-        while let Some(&(addr, _)) = self
-            .multicast
-            .groups
-            .iter()
-            .find(|&&(_, state)| state == GroupState::Leaving)
-        {
-            match addr {
-                #[cfg(feature = "ipv4")]
-                IpAddr::V4(addr) => {
-                    if let Some(pkt) = self.igmp_leave_packet(addr) {
-                        self.dispatch_ip(inner, pkt);
-                    }
-                }
-                #[cfg(feature = "ipv6")]
-                IpAddr::V6(addr) => {
-                    if let Some(pkt) =
-                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToInclude, addr)))
-                    {
-                        self.dispatch_ip(inner, pkt);
-                    }
-                }
-            }
-
-            self.multicast.remove(&addr);
         }
 
         // Send every report that is due. After a late poll, several of the reports
