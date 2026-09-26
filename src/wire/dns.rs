@@ -284,30 +284,20 @@ impl<'a> Packet<'a> {
     }
 }
 
-/// Parse part of a name from `bytes`, not following pointers.
-/// Returns the unused part of `bytes`, and the pointer offset if the sequence ends with a pointer.
-fn parse_name_part<'a>(
-    mut bytes: &'a [u8],
-    mut f: impl FnMut(&'a [u8]),
-) -> Result<(&'a [u8], Option<usize>), Malformed> {
+/// Skip the name at the start of `bytes`, not following pointers, and return what
+/// comes after it.
+fn skip_name(mut bytes: &[u8]) -> Result<&[u8], Malformed> {
     loop {
         let x = *bytes.first().ok_or(Malformed)?;
         bytes = &bytes[1..];
         match x {
-            0x00 => return Ok((bytes, None)),
+            0x00 => return Ok(bytes),
             x if x & 0xC0 == 0x00 => {
                 let len = (x & 0x3F) as usize;
-                let label = bytes.get(..len).ok_or(Malformed)?;
-                bytes = &bytes[len..];
-                f(label);
+                bytes = bytes.get(len..).ok_or(Malformed)?;
             }
-            x if x & 0xC0 == 0xC0 => {
-                let y = *bytes.first().ok_or(Malformed)?;
-                bytes = &bytes[1..];
-
-                let ptr = ((x & 0x3F) as usize) << 8 | (y as usize);
-                return Ok((bytes, Some(ptr)));
-            }
+            // A pointer ends the name.
+            x if x & 0xC0 == 0xC0 => return bytes.get(1..).ok_or(Malformed),
             _ => return Err(Malformed),
         }
     }
@@ -331,7 +321,7 @@ impl<'a> Question<'a> {
     /// # Errors
     /// - `Malformed`: if the buffer is too short, or the class is not IN.
     pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Question<'a>), Malformed> {
-        let (rest, _) = parse_name_part(buffer, |_| ())?;
+        let rest = skip_name(buffer)?;
         let name = &buffer[..buffer.len() - rest.len()];
 
         if rest.len() < 4 {
@@ -418,7 +408,7 @@ impl<'a> Record<'a> {
     /// # Errors
     /// - `Malformed`: if the buffer is too short, or the class is not IN.
     pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Record<'a>), Malformed> {
-        let (rest, _) = parse_name_part(buffer, |_| ())?;
+        let rest = skip_name(buffer)?;
         let name = &buffer[..buffer.len() - rest.len()];
 
         if rest.len() < 10 {
