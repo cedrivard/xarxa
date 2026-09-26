@@ -7,11 +7,16 @@
 
 use core::fmt;
 
-#[cfg(feature = "tcp-sack")]
+#[cfg(any(feature = "tcp-sack", feature = "tcp-timestamps"))]
 use byteorder::{ByteOrder, NetworkEndian};
 
 use crate::driver::ChecksumCapabilities;
 use crate::error::Malformed;
+#[cfg(feature = "tcp-timestamps")]
+use crate::wire::tcp_field::OPT_TSTAMP;
+use crate::wire::tcp_field::{OPT_END, OPT_MSS, OPT_WS};
+#[cfg(feature = "tcp-sack")]
+use crate::wire::tcp_field::{OPT_SACKPERM, OPT_SACKRNG};
 use crate::wire::{IpAddr, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
 
 /// A high-level representation of a Transmission Control Protocol packet.
@@ -224,43 +229,40 @@ impl<'a> TcpRepr<'a> {
         }
         packet.set_ack(self.ack_number.is_some());
         {
+            // The options are written straight into the header, padded to its
+            // length with end-of-list options.
             let mut options = packet.options_mut();
             if let Some(value) = self.max_seg_size {
-                let tmp = options;
-                options = TcpOption::MaxSegmentSize(value).emit(tmp);
+                let [hi, lo] = value.to_be_bytes();
+                options[..4].copy_from_slice(&[OPT_MSS, 4, hi, lo]);
+                options = &mut options[4..];
             }
             if let Some(value) = self.window_scale {
-                let tmp = options;
-                options = TcpOption::WindowScale(value).emit(tmp);
+                options[..3].copy_from_slice(&[OPT_WS, 3, value]);
+                options = &mut options[3..];
             }
             #[cfg(feature = "tcp-sack")]
             if self.sack_permitted {
-                let tmp = options;
-                options = TcpOption::SackPermitted.emit(tmp);
+                options[..2].copy_from_slice(&[OPT_SACKPERM, 2]);
+                options = &mut options[2..];
             } else if self.ack_number.is_some() && self.sack_ranges.iter().any(|s| s.is_some()) {
-                let mut blocks = [0; 24];
-                let mut len = 0;
+                let mut len = 2;
                 for &(left, right) in self.sack_ranges.iter().flatten() {
-                    NetworkEndian::write_u32(&mut blocks[len..], left);
-                    NetworkEndian::write_u32(&mut blocks[len + 4..], right);
+                    NetworkEndian::write_u32(&mut options[len..], left);
+                    NetworkEndian::write_u32(&mut options[len + 4..], right);
                     len += 8;
                 }
-                let tmp = options;
-                options = TcpOption::SackRange(&blocks[..len]).emit(tmp);
+                options[..2].copy_from_slice(&[OPT_SACKRNG, len as u8]);
+                options = &mut options[len..];
             }
             #[cfg(feature = "tcp-timestamps")]
             if let Some(timestamp) = self.timestamp {
-                let tmp = options;
-                options = TcpOption::TimeStamp {
-                    tsval: timestamp.tsval,
-                    tsecr: timestamp.tsecr,
-                }
-                .emit(tmp);
+                options[..2].copy_from_slice(&[OPT_TSTAMP, 10]);
+                NetworkEndian::write_u32(&mut options[2..], timestamp.tsval);
+                NetworkEndian::write_u32(&mut options[6..], timestamp.tsecr);
+                options = &mut options[10..];
             }
-
-            if !options.is_empty() {
-                TcpOption::EndOfList.emit(options);
-            }
+            options.fill(OPT_END);
         }
         packet.set_urgent_at(0);
         let payload = packet.payload_mut();
@@ -376,6 +378,33 @@ mod test {
             &ChecksumCapabilities::default(),
         );
         assert_eq!(&bytes[..], &SYN_PACKET_BYTES[..]);
+    }
+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_emit_sack_ranges() {
+        let repr = TcpRepr {
+            control: TcpControl::None,
+            ack_number: Some(TcpSeqNumber(0)),
+            sack_ranges: [Some((1, 2)), None, Some((0x0304_0506, 0x0708_090a))],
+            payload: &[],
+            ..packet_repr()
+        };
+        let mut bytes = vec![0xa5; repr.buffer_len()];
+        let mut packet = TcpPacket::new_unchecked(&mut bytes);
+        repr.emit(
+            &mut packet,
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &ChecksumCapabilities::default(),
+        );
+        assert_eq!(
+            packet.options(),
+            &[
+                0x05, 0x12, 0, 0, 0, 1, 0, 0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, // SACK, two blocks
+                0x00, 0x00, // end of list padding
+            ]
+        );
     }
 
     #[test]

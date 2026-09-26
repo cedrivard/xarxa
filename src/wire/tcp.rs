@@ -82,7 +82,7 @@ pub struct Packet<'a> {
     buffer: &'a mut [u8],
 }
 
-mod field {
+pub(crate) mod field {
     #![allow(non_snake_case)]
 
     use crate::wire::field::*;

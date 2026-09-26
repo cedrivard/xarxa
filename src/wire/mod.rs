@@ -200,6 +200,8 @@ pub use self::sixlowpan::{
 };
 
 #[cfg(feature = "tcp")]
+pub(crate) use self::tcp::field as tcp_field;
+#[cfg(feature = "tcp")]
 pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
