@@ -446,9 +446,21 @@ impl IfaceState<'_> {
         // Addresses come and go without touching the link state: the router that
         // advertised the prefix has just been entered into the neighbor cache.
         //
-        // Every valid prefix gets its address...
+        // Every valid prefix gets its address, and the address of every expired
+        // prefix goes. A prefix forms at most one address in the table.
         for (prefix, prefixinfo) in slaac.prefix.iter() {
+            let Some(address) = from_link_prefix(prefix, hardware_addr) else {
+                continue;
+            };
+            let existing = self.ip_addrs.iter().position(|a| a.cidr == IpCidr::V6(address));
             if !prefixinfo.is_valid(timestamp) {
+                // Only one we installed. Somebody else's address that happens to be
+                // the one this prefix forms is not ours to remove.
+                if let Some(i) = existing
+                    && self.ip_addrs[i].origin == AddrOrigin::Slaac
+                {
+                    self.ip_addrs.remove(i);
+                }
                 continue;
             }
             // A preferred lifetime that has run out is not kept as a time.
@@ -457,19 +469,16 @@ impl IfaceState<'_> {
             } else {
                 Preferred::Never
             };
-            let Some(address) = from_link_prefix(prefix, hardware_addr) else {
-                continue;
-            };
-            match self.ip_addrs.iter_mut().find(|a| a.cidr == IpCidr::V6(address)) {
+            match existing {
                 // One we installed: refresh it rather than leave it behind. The router
                 // shortens a prefix's preferred lifetime to retire it, and the address
                 // formed from it has to follow, or nothing downstream can tell that it
                 // is on its way out.
-                Some(existing) if existing.origin == AddrOrigin::Slaac => {
-                    existing.preferred = preferred;
+                Some(i) if self.ip_addrs[i].origin == AddrOrigin::Slaac => {
+                    self.ip_addrs[i].preferred = preferred;
                 }
                 // Somebody else's, and it only happens to be the address this prefix
-                // forms. Not ours to deprecate: the expiry below leaves it alone too.
+                // forms. Not ours to deprecate.
                 Some(_) => {}
                 None => {
                     let new_addr = IfaceAddr {
@@ -483,58 +492,38 @@ impl IfaceState<'_> {
                 }
             }
         }
-        // ...and the address of every expired prefix goes.
-        self.ip_addrs.retain(|a| match a.cidr {
-            IpCidr::V6(address) => {
-                !(a.origin == AddrOrigin::Slaac
-                    && slaac.prefix.iter().any(|(prefix, prefixinfo)| {
-                        !prefixinfo.is_valid(timestamp) && from_link_prefix(prefix, hardware_addr) == Some(address)
-                    }))
-            }
-            #[allow(unreachable_patterns)]
-            _ => true,
-        });
 
-        {
-            let handle = self.handle;
-            let slaac_routes = &slaac.routes;
-            inner.routes.retain(|r| match (&r.cidr, &r.via_router) {
-                (IpCidr::V6(cidr), crate::wire::IpAddr::V6(via_router)) => {
-                    !(r.origin == RouteOrigin::Slaac
-                        && r.iface == handle
-                        && slaac_routes
-                            .iter()
-                            .any(|f| !f.is_valid(timestamp) && f.same_route(cidr, via_router)))
+        // Likewise, every valid route is installed, and every expired one goes. A
+        // route is in the table at most once.
+        let handle = self.handle;
+        let installed = |r: &IfaceRoute, route: &Route| {
+            r.origin == RouteOrigin::Slaac
+                && r.iface == handle
+                && match (&r.cidr, &r.via_router) {
+                    (IpCidr::V6(cidr), crate::wire::IpAddr::V6(via_router)) => route.same_route(cidr, via_router),
+                    #[allow(unreachable_patterns)]
+                    _ => false,
                 }
-                #[allow(unreachable_patterns)]
-                _ => true,
-            });
-
-            for route in slaac_routes.iter().filter(|r| r.is_valid(timestamp)) {
-                if let Some(existing) = inner.routes.iter_mut().find(|r| {
-                    r.origin == RouteOrigin::Slaac
-                        && r.iface == handle
-                        && match (&r.cidr, &r.via_router) {
-                            (IpCidr::V6(cidr), crate::wire::IpAddr::V6(via_router)) => {
-                                route.same_route(cidr, via_router)
-                            }
-                            #[allow(unreachable_patterns)]
-                            _ => false,
-                        }
-                }) {
-                    existing.expires_at = Some(route.valid_until);
-                } else {
-                    let new_route = IfaceRoute {
-                        cidr: route.cidr.into(),
-                        via_router: route.via_router.into(),
-                        iface: handle,
-                        origin: RouteOrigin::Slaac,
-                        preferred_until: None,
-                        expires_at: Some(route.valid_until),
-                    };
-                    if inner.routes.add(new_route).is_err() {
-                        warn!("slaac: route table full, route via {} not installed", route.via_router);
-                    }
+        };
+        for route in slaac.routes.iter() {
+            if !route.is_valid(timestamp) {
+                let existing = inner.routes.iter().position(|r| installed(r, route));
+                if let Some(i) = existing {
+                    inner.routes.remove(i);
+                }
+            } else if let Some(existing) = inner.routes.iter_mut().find(|r| installed(r, route)) {
+                existing.expires_at = Some(route.valid_until);
+            } else {
+                let new_route = IfaceRoute {
+                    cidr: route.cidr.into(),
+                    via_router: route.via_router.into(),
+                    iface: handle,
+                    origin: RouteOrigin::Slaac,
+                    preferred_until: None,
+                    expires_at: Some(route.valid_until),
+                };
+                if inner.routes.add(new_route).is_err() {
+                    warn!("slaac: route table full, route via {} not installed", route.via_router);
                 }
             }
         }
