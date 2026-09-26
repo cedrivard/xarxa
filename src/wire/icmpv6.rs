@@ -337,13 +337,10 @@ impl<'a> Packet<'a> {
         self.buffer[field::CODE] = value
     }
 
-    /// Clear any reserved fields in the message header.
+    /// Clear the reserved fields of the message header.
     ///
-    /// # Panics
-    /// This function panics if the message type has not been set.
-    /// See [set_msg_type].
-    ///
-    /// [set_msg_type]: #method.set_msg_type
+    /// Set the message type first. Message types with no reserved fields are
+    /// left unchanged.
     #[inline]
     pub fn clear_reserved(&mut self) {
         match self.msg_type() {
@@ -362,7 +359,7 @@ impl<'a> Packet<'a> {
             Message::MldReport => {
                 NetworkEndian::write_u16(&mut self.buffer[field::RECORD_RESV], 0);
             }
-            ty => panic!("Message type `{}` does not have any reserved fields.", ty),
+            _ => {}
         }
     }
 
