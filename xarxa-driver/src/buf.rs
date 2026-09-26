@@ -348,16 +348,18 @@ impl Deref for PacketBuf {
     fn deref(&self) -> &Self::Target {
         let inner = self.inner();
         let start = inner.headroom as usize;
-        let end = start + inner.len as usize;
-        &inner.data[start..end]
+        // SAFETY: `headroom + len <= PACKET_BUF_SIZE`, which every method that
+        // changes either of them checks.
+        unsafe { inner.data.get_unchecked(start..start + inner.len as usize) }
     }
 }
 impl DerefMut for PacketBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         let inner = self.inner_mut();
         let start = inner.headroom as usize;
-        let end = start + inner.len as usize;
-        &mut inner.data[start..end]
+        // SAFETY: `headroom + len <= PACKET_BUF_SIZE`, which every method that
+        // changes either of them checks.
+        unsafe { inner.data.get_unchecked_mut(start..start + inner.len as usize) }
     }
 }
 
