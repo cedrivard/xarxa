@@ -7,7 +7,7 @@ use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT};
 use crate::iface::IfaceHandle;
 use crate::rand::Rand;
 use crate::stack::{IfaceBinding, Stack, addr_score};
-use crate::storage::{BoundedDeque, Slab};
+use crate::storage::{BoundedVec, Slab};
 use crate::tcp::TcpSeqNumber;
 use crate::tcp::congestion::Controller as _;
 #[cfg(feature = "async")]
@@ -52,8 +52,9 @@ pub(crate) struct TcpListenerState {
     local: ListenSocketAddr,
     /// The interface the listener is bound to. Zero-sized without `iface-bind`.
     binding: IfaceBinding,
-    /// The accept queue: SYNs waiting to be accepted, deduplicated by 4-tuple.
-    queue: BoundedDeque<PendingSyn, TCP_LISTENER_BACKLOG>,
+    /// The accept queue: SYNs waiting to be accepted, oldest first, deduplicated
+    /// by 4-tuple.
+    queue: BoundedVec<PendingSyn, TCP_LISTENER_BACKLOG>,
     #[cfg(feature = "async")]
     accept_waker: WakerRegistration,
 }
@@ -63,7 +64,7 @@ impl TcpListenerState {
         TcpListenerState {
             local: ListenSocketAddr::UNSPECIFIED,
             binding: IfaceBinding::Any,
-            queue: BoundedDeque::new(),
+            queue: BoundedVec::new(),
             #[cfg(feature = "async")]
             accept_waker: WakerRegistration::new(),
         }
@@ -118,7 +119,7 @@ impl TcpListenerState {
         if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
             *entry = syn;
         } else {
-            if self.queue.push_back(syn).is_err() {
+            if self.queue.push(syn).is_err() {
                 trace!(
                     "listener:{}: backlog full, dropping SYN from {}",
                     self.local, tuple.remote
@@ -142,14 +143,14 @@ impl TcpListenerState {
             local: SocketAddr::new(*dst_addr, repr.dst_port),
             remote: SocketAddr::new(*src_addr, repr.src_port),
         };
-        let before = self.queue.len();
-        self.queue
-            .retain(|s| !(s.tuple == tuple && repr.seq_number == s.remote_seq_no));
-        if self.queue.len() != before {
-            trace!("listener: queued SYN {} reset by remote", tuple);
-            true
-        } else {
-            false
+        // The queue holds at most one SYN per 4-tuple.
+        match self.queue.iter().position(|s| s.tuple == tuple) {
+            Some(i) if self.queue[i].remote_seq_no == repr.seq_number => {
+                self.queue.remove(i);
+                trace!("listener: queued SYN {} reset by remote", tuple);
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -420,7 +421,10 @@ impl TcpListener<'_> {
     /// [`TcpSocket::accept`]: crate::tcp::TcpSocket::accept
     pub fn accept(&mut self) -> Option<AcceptToken> {
         let state = self.inner_mut();
-        let syn = state.queue.pop_front()?;
+        if state.queue.is_empty() {
+            return None;
+        }
+        let syn = state.queue.remove(0);
         let binding = state.binding;
         trace!("listener:{}: accepting {}", state.local, syn.tuple);
         Some(AcceptToken { syn, binding })
