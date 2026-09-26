@@ -850,7 +850,7 @@ impl IfaceState<'_> {
                     preferred: Preferred::Always,
                 };
                 if self.ip_addrs.push(addr).is_err() {
-                    warn!("dhcp: address table full, {} not assigned", cidr);
+                    warn!("dhcp: address table full (iface-addr-count), leased address not assigned");
                 }
             }
             inner.purge_iface_link_state(self.handle);

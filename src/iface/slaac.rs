@@ -203,7 +203,7 @@ impl Slaac {
         if let Some((_, old_info)) = self.prefix.iter_mut().find(|(c, _)| c == cidr) {
             *old_info = prefix_info;
         } else if self.prefix.push((*cidr, prefix_info)).is_err() {
-            warn!("slaac: prefix table full, ignoring prefix {}", cidr);
+            warn!("slaac: prefix table full (slaac-prefix-count), ignoring a prefix");
             return;
         }
         // Unlike the original, a refreshed lifetime also syncs, so the expiry on
@@ -231,7 +231,7 @@ impl Slaac {
             })
             .is_err()
         {
-            warn!("slaac: router table full, ignoring route via {}", router);
+            warn!("slaac: router table full (slaac-router-count), ignoring a router");
             return;
         }
         self.sync_required = true;
@@ -487,7 +487,7 @@ impl IfaceState<'_> {
                         preferred,
                     };
                     if self.ip_addrs.push(new_addr).is_err() {
-                        warn!("slaac: address table full, {} not assigned", address);
+                        warn!("slaac: address table full (iface-addr-count), address not assigned");
                     }
                 }
             }
@@ -523,7 +523,7 @@ impl IfaceState<'_> {
                     expires_at: Some(route.valid_until),
                 };
                 if inner.routes.add(new_route).is_err() {
-                    warn!("slaac: route table full, route via {} not installed", route.via_router);
+                    warn!("slaac: route table full (route-count), route not installed");
                 }
             }
         }
