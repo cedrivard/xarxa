@@ -1493,7 +1493,9 @@ impl<'d> Stack<'d> {
         // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
         // or destination in any IP datagram. Drop such TCP segments early to avoid
         // creating sockets with unspecified peers (which would later panic on egress).
-        if src_addr.is_unspecified() || dst_addr.is_unspecified() {
+        // The destination was already checked to be one of ours. The IPv4 layer lets
+        // an unspecified source through, for DHCP.
+        if src_addr.is_unspecified() {
             return;
         }
 
