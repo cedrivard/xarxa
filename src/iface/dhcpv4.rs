@@ -71,6 +71,22 @@ pub struct DhcpLease {
     pub options: DhcpLeaseOptions,
 }
 
+/// What a lease installs on the interface.
+#[derive(Clone, Copy)]
+struct Installed {
+    address: Ipv4Cidr,
+    router: Option<Ipv4Addr>,
+}
+
+impl DhcpLease {
+    fn installed(&self) -> Installed {
+        Installed {
+            address: self.address,
+            router: self.router,
+        }
+    }
+}
+
 /// How to reach a DHCP server.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -644,14 +660,15 @@ impl IfaceState<'_> {
                 else {
                     return;
                 };
+                let new = lease.installed();
                 client.state = ClientState::Renewing(RenewState {
-                    lease: lease.clone(),
+                    lease,
                     renew_at,
                     rebind_at,
                     expires_at,
                     rebinding: false,
                 });
-                self.dhcpv4_apply(inner, Some(&lease), None);
+                self.dhcpv4_apply(inner, Some(new), None);
             }
             (ClientState::Renewing(state), DhcpMessageType::Ack) => {
                 let Some((lease, renew_at, rebind_at, expires_at)) =
@@ -664,8 +681,9 @@ impl IfaceState<'_> {
                 state.rebinding = false;
                 state.expires_at = expires_at;
                 if state.lease != lease {
-                    let old = core::mem::replace(&mut state.lease, lease.clone());
-                    self.dhcpv4_apply(inner, Some(&lease), Some(&old));
+                    let (new, old) = (lease.installed(), state.lease.installed());
+                    state.lease = lease;
+                    self.dhcpv4_apply(inner, Some(new), Some(old));
                 }
             }
             (ClientState::Requesting(_) | ClientState::Renewing(_), DhcpMessageType::Nak) => {
@@ -830,7 +848,7 @@ impl IfaceState<'_> {
         trace!("DHCP reset");
         let old = core::mem::replace(&mut client.state, ClientState::Init);
         if let ClientState::Renewing(state) = old {
-            self.dhcpv4_apply(inner, None, Some(&state.lease));
+            self.dhcpv4_apply(inner, None, Some(state.lease.installed()));
         }
     }
 
@@ -838,7 +856,7 @@ impl IfaceState<'_> {
     /// route via the router.
     ///
     /// Addresses and routes that are not part of the old lease are left alone.
-    fn dhcpv4_apply(&mut self, inner: &mut StackInner, new: Option<&DhcpLease>, old: Option<&DhcpLease>) {
+    fn dhcpv4_apply(&mut self, inner: &mut StackInner, new: Option<Installed>, old: Option<Installed>) {
         let old_addr = old.map(|l| IpCidr::V4(l.address));
         let new_addr = new.map(|l| IpCidr::V4(l.address));
         if old_addr != new_addr {
@@ -867,7 +885,7 @@ impl IfaceState<'_> {
                     ..Route::new_ipv4_gateway(new_router, handle)
                 };
                 if inner.routes.add(route).is_err() {
-                    warn!("dhcp: route table full, default route not installed");
+                    warn!("dhcp: route table full (route-count), default route not installed");
                 }
             }
         }
