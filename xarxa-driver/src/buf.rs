@@ -87,7 +87,6 @@ static POOL: Pool = Pool {
 
 /// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
 #[cfg(target_has_atomic = "32")]
-#[inline(never)]
 fn alloc_slot() -> Option<usize> {
     for (w, word) in POOL.used.iter().enumerate() {
         let mut cur = word.load(Ordering::Relaxed);
@@ -158,6 +157,27 @@ fn free_slot(index: usize) {
     })
 }
 
+/// Claim a free slot and initialize its header, for a new `PacketBuf`.
+#[inline(never)] // helps code size: it is all of `PacketBuf::try_new`, which has many callers
+fn alloc() -> Option<NonNull<PacketBufInner>> {
+    let index = alloc_slot()?;
+    let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
+    // SAFETY:
+    // - the slot is ours (its bit is set), and nothing else points into it.
+    // - `data` is valid thanks to `MaybeUninit::zeroed()`, we don't have to initialize it.
+    // - We do initialize the header.
+    unsafe {
+        (&raw mut (*ptr).headroom).write(0);
+        (&raw mut (*ptr).len).write(0);
+        (&raw mut (*ptr).meta).write(PacketMeta::default());
+        // Catch code that relies on fresh buffers being zeroed.
+        #[cfg(test)]
+        (*ptr).data.fill(0xa5);
+    }
+    // SAFETY: a pointer into a static is never null.
+    Some(unsafe { NonNull::new_unchecked(ptr) })
+}
+
 /// An owned network packet buffer.
 ///
 /// ```text
@@ -180,24 +200,7 @@ impl PacketBuf {
     ///
     /// Storage is not cleared and may contain data from previous, unrelated packets.
     pub fn try_new() -> Option<Self> {
-        let index = alloc_slot()?;
-        let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
-        // SAFETY:
-        // - the slot is ours (its bit is set), and nothing else points into it.
-        // - `data` is valid thanks to `MaybeUninit::zeroed()`, we don't have to initialize it.
-        // - We do initialize the header.
-        unsafe {
-            (&raw mut (*ptr).headroom).write(0);
-            (&raw mut (*ptr).len).write(0);
-            (&raw mut (*ptr).meta).write(PacketMeta::default());
-            // Catch code that relies on fresh buffers being zeroed.
-            #[cfg(test)]
-            (*ptr).data.fill(0xa5);
-        }
-        Some(Self {
-            // SAFETY: a pointer into a static is never null.
-            inner: unsafe { NonNull::new_unchecked(ptr) },
-        })
+        Some(Self { inner: alloc()? })
     }
 
     #[inline]
