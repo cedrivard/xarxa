@@ -261,14 +261,17 @@ impl PacketBuf {
         PACKET_BUF_SIZE - self.headroom() - self.len()
     }
 
-    /// Set the headroom on an empty buffer, before writing a payload.
+    /// Empty the buffer, with `headroom` bytes of room in front of the payload.
+    ///
+    /// Use it on a new buffer, before writing a payload.
     ///
     /// # Panics
-    /// Panics if the buffer is not empty, or if `headroom > capacity`.
+    /// Panics if `headroom > capacity`.
     pub fn reserve(&mut self, headroom: usize) {
-        assert!(self.inner().len == 0);
         assert!(headroom <= PACKET_BUF_SIZE);
-        self.inner_mut().headroom = headroom as u16;
+        let inner = self.inner_mut();
+        inner.headroom = headroom as u16;
+        inner.len = 0;
     }
 
     /// Grow the payload at the front by `n` bytes, taking them from the headroom.
