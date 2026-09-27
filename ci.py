@@ -95,6 +95,8 @@ EXTRAS = [
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
     "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
+    "packet-buf-driver-headroom-16",
+    "packet-buf-driver-headroom-32",
 ]
 
 # The whole API, minus the features that are mutually exclusive with another.
@@ -185,7 +187,13 @@ def collect():
 
     # `xarxa-driver` on its own, every feature combination it has (it has few).
     # The combinations above only build it with the features xarxa forwards.
-    for extra in ["", "defmt", "packetmeta-id", "packetmeta-timestamp", "packetmeta-timestamp,defmt"]:
+    for extra in [
+        "",
+        "defmt",
+        "packetmeta-id",
+        "packetmeta-timestamp",
+        "packetmeta-timestamp,defmt",
+    ]:
         args = ["check", "-p", "xarxa-driver"]
         if extra:
             args += ["--features", extra]

@@ -208,6 +208,13 @@ packet-buf-size-9022 = ["xarxa-driver/packet-buf-size-9022"]
 packet-buf-size-9216 = ["xarxa-driver/packet-buf-size-9216"]
 packet-buf-size-16384 = ["xarxa-driver/packet-buf-size-16384"]
 
+packet-buf-driver-headroom-2 = ["xarxa-driver/packet-buf-driver-headroom-2"]
+packet-buf-driver-headroom-4 = ["xarxa-driver/packet-buf-driver-headroom-4"]
+packet-buf-driver-headroom-8 = ["xarxa-driver/packet-buf-driver-headroom-8"]
+packet-buf-driver-headroom-16 = ["xarxa-driver/packet-buf-driver-headroom-16"]
+packet-buf-driver-headroom-32 = ["xarxa-driver/packet-buf-driver-headroom-32"]
+packet-buf-driver-headroom-64 = ["xarxa-driver/packet-buf-driver-headroom-64"]
+
 iface-count-1 = []
 iface-count-2 = [] # Default
 iface-count-3 = []
