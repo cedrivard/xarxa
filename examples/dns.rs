@@ -76,7 +76,7 @@ fn main() {
 
     loop {
         let stack_deadline = stack.poll(Instant::now());
-        let dns_deadline = dns.poll(&mut stack);
+        let dns_deadline = dns.poll(&mut stack, Instant::now());
 
         match dns.get_query_result(query) {
             Ok(addrs) => {

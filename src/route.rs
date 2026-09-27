@@ -20,7 +20,7 @@ use crate::storage::Vec;
 
 use crate::iface::IfaceHandle;
 use crate::stack::IfaceBinding;
-use crate::time::Instant;
+use crate::time::{Clock, Instant};
 use crate::wire::{IpAddr, IpCidr};
 #[cfg(feature = "ipv4")]
 use crate::wire::{Ipv4Addr, Ipv4Cidr};
@@ -276,7 +276,7 @@ impl Routes {
     /// A bound socket (`binding`) only considers routes that go out of its
     /// interface. Without the `iface-bind` feature the binding is always
     /// `Any` and the filter compiles out.
-    pub(crate) fn lookup(&self, binding: IfaceBinding, addr: &IpAddr, timestamp: Instant) -> Option<&Route> {
+    pub(crate) fn lookup(&self, binding: IfaceBinding, addr: &IpAddr) -> Option<&Route> {
         assert!(addr.is_unicast());
 
         self.storage
@@ -286,11 +286,6 @@ impl Routes {
                 // `add` rejects these, but `iter_mut` can still write one in. A
                 // gateway that isn't unicast can't be resolved as a next hop.
                 if !route.via_router.is_unicast() {
-                    return false;
-                }
-                if let Some(expires_at) = route.expires_at
-                    && expires_at <= timestamp
-                {
                     return false;
                 }
                 if let Some(iface) = binding.iface()
@@ -304,13 +299,18 @@ impl Routes {
             .max_by_key(|route| route.cidr.prefix_len())
     }
 
-    /// Remove the routes that expired. A lookup ignores them already, this
-    /// keeps them from taking up room in the table.
-    pub(crate) fn remove_expired(&mut self, now: Instant) {
+    /// Remove the routes that expired, and count the expiry of the others toward
+    /// the next deadline. A lookup doesn't look at expiries: the stack is polled
+    /// when one is due.
+    ///
+    /// The poll calls this at its start, before anything in it routes, and at its
+    /// end, after everything that can add or refresh a route. Only the end call's
+    /// deadline counts.
+    pub(crate) fn remove_expired(&mut self, clock: &mut Clock) {
         // Not `retain`: that is a new copy of the loop for every closure.
         let mut i = 0;
         while let Some(route) = self.storage.get(i) {
-            if route.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            if route.expires_at.is_some_and(|expires_at| clock.expired(expires_at)) {
                 self.storage.remove(i);
             } else {
                 i += 1;
@@ -346,10 +346,11 @@ mod test {
         Ipv6Cidr::new(Ipv6Addr::new(0xfe80, 0, 0, 0x3364, 0, 0, 0, 0), 64)
     }
 
-    /// Look up and return (via_router, iface).
-    fn lookup(routes: &Routes, addr: Ipv6Addr, at_millis: i64) -> Option<(IpAddr, IfaceHandle)> {
+    /// Poll the table at `at_millis`, then look up and return (via_router, iface).
+    fn lookup(routes: &mut Routes, addr: Ipv6Addr, at_millis: i64) -> Option<(IpAddr, IfaceHandle)> {
+        routes.remove_expired(&mut Clock::new(Instant::from_millis(at_millis)));
         routes
-            .lookup(IfaceBinding::Any, &addr.into(), Instant::from_millis(at_millis))
+            .lookup(IfaceBinding::Any, &addr.into())
             .map(|route| (route.via_router, route.iface))
     }
 
@@ -373,16 +374,15 @@ mod test {
                 .unwrap();
         }
 
-        let at = Instant::from_millis(0);
         assert_eq!(
             routes
-                .lookup(IfaceBinding::Iface(IF_0), &ADDR_2A.into(), at)
+                .lookup(IfaceBinding::Iface(IF_0), &ADDR_2A.into())
                 .map(|r| r.via_router),
             Some(ADDR_1A.into())
         );
         assert_eq!(
             routes
-                .lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into(), at)
+                .lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into())
                 .map(|r| r.via_router),
             Some(ADDR_1B.into())
         );
@@ -399,19 +399,19 @@ mod test {
                 expires_at: None,
             })
             .unwrap();
-        assert!(routes2.lookup(IfaceBinding::Any, &ADDR_2A.into(), at).is_some());
-        assert!(routes2.lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into(), at).is_none());
+        assert!(routes2.lookup(IfaceBinding::Any, &ADDR_2A.into()).is_some());
+        assert!(routes2.lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into()).is_none());
     }
 
     #[test]
     fn test_fill() {
         let mut routes = Routes::new();
 
-        assert_eq!(lookup(&routes, ADDR_1A, 0), None);
-        assert_eq!(lookup(&routes, ADDR_1B, 0), None);
-        assert_eq!(lookup(&routes, ADDR_1C, 0), None);
-        assert_eq!(lookup(&routes, ADDR_2A, 0), None);
-        assert_eq!(lookup(&routes, ADDR_2B, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_1A, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_1B, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_1C, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_2B, 0), None);
 
         let route = Route {
             cidr: cidr_1().into(),
@@ -423,11 +423,11 @@ mod test {
         };
         routes.add(route).unwrap();
 
-        assert_eq!(lookup(&routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
-        assert_eq!(lookup(&routes, ADDR_1B, 0), Some((ADDR_1A.into(), IF_0)));
-        assert_eq!(lookup(&routes, ADDR_1C, 0), Some((ADDR_1A.into(), IF_0)));
-        assert_eq!(lookup(&routes, ADDR_2A, 0), None);
-        assert_eq!(lookup(&routes, ADDR_2B, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_1B, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_1C, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_2B, 0), None);
 
         let route2 = Route {
             cidr: cidr_2().into(),
@@ -439,15 +439,15 @@ mod test {
         };
         routes.add(route2).unwrap();
 
-        assert_eq!(lookup(&routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
-        assert_eq!(lookup(&routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
-        assert_eq!(lookup(&routes, ADDR_2B, 0), Some((ADDR_2A.into(), IF_1)));
+        assert_eq!(lookup(&mut routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
+        assert_eq!(lookup(&mut routes, ADDR_2B, 0), Some((ADDR_2A.into(), IF_1)));
 
         // Up to the expiry timestamp the route is valid...
-        assert_eq!(lookup(&routes, ADDR_2A, 9), Some((ADDR_2A.into(), IF_1)));
+        assert_eq!(lookup(&mut routes, ADDR_2A, 9), Some((ADDR_2A.into(), IF_1)));
         // ...and from it on, the route is gone.
-        assert_eq!(lookup(&routes, ADDR_2B, 10), None);
-        assert_eq!(lookup(&routes, ADDR_1A, 10), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_2B, 10), None);
+        assert_eq!(lookup(&mut routes, ADDR_1A, 10), Some((ADDR_1A.into(), IF_0)));
     }
 
     #[test]
@@ -467,9 +467,9 @@ mod test {
             .unwrap();
 
         // In cidr_2: the /64 wins over the default route.
-        assert_eq!(lookup(&routes, ADDR_2B, 0), Some((ADDR_2A.into(), IF_1)));
+        assert_eq!(lookup(&mut routes, ADDR_2B, 0), Some((ADDR_2A.into(), IF_1)));
         // Everything else: the default route.
-        assert_eq!(lookup(&routes, ADDR_1B, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_1B, 0), Some((ADDR_1A.into(), IF_0)));
     }
 
     #[test]
@@ -530,10 +530,10 @@ mod test {
     fn test_lookup_skips_router_not_unicast() {
         let mut routes = Routes::new();
         routes.add_default_ipv6_route(ADDR_1A, IF_0).unwrap();
-        assert_eq!(lookup(&routes, ADDR_2A, 0), Some((ADDR_1A.into(), IF_0)));
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), Some((ADDR_1A.into(), IF_0)));
 
         routes.iter_mut().next().unwrap().via_router = Ipv6Addr::UNSPECIFIED.into();
-        assert_eq!(lookup(&routes, ADDR_2A, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), None);
     }
 
     #[test]
@@ -561,8 +561,8 @@ mod test {
             .unwrap();
 
         routes.purge_iface(IF_0);
-        assert_eq!(lookup(&routes, ADDR_1A, 0), None);
-        assert_eq!(lookup(&routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
+        assert_eq!(lookup(&mut routes, ADDR_1A, 0), None);
+        assert_eq!(lookup(&mut routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
     }
 }
 

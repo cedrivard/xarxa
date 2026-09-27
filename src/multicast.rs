@@ -438,7 +438,7 @@ impl IfaceState<'_> {
     /// query is answered with one report per group, spread evenly over the query's Max Resp
     /// Time, and a group-specific query after a quarter of it.
     #[cfg(feature = "ipv4")]
-    pub(crate) fn process_igmp(&mut self, inner: &mut StackInner, dst_addr: Ipv4Addr, mut buf: PacketBuf) {
+    pub(crate) fn process_igmp(&mut self, dst_addr: Ipv4Addr, mut buf: PacketBuf, now: Instant) {
         let igmp_packet = check!(IgmpPacket::new_checked(&mut buf));
         if !igmp_packet.verify_checksum() {
             trace!("igmp: checksum incorrect");
@@ -481,7 +481,7 @@ impl IfaceState<'_> {
                         };
                         self.multicast.igmp_report_state = IgmpReportState::ToGeneralQuery {
                             version,
-                            timeout: inner.now + interval,
+                            timeout: now + interval,
                             interval,
                             next_index: 0,
                         };
@@ -493,7 +493,7 @@ impl IfaceState<'_> {
                         let timeout = max_resp_time / 4;
                         self.multicast.igmp_report_state = IgmpReportState::ToSpecificQuery {
                             version,
-                            timeout: inner.now + timeout,
+                            timeout: now + timeout,
                             group: group_addr,
                         };
                     }
@@ -572,7 +572,13 @@ impl IfaceState<'_> {
     /// Maximum Response Delay (RFC 3810 §6.2). A Maximum Response Code of zero asks for an
     /// immediate report.
     #[cfg(feature = "ipv6")]
-    pub(crate) fn process_mldv2(&mut self, inner: &mut StackInner, dst_addr: Ipv6Addr, icmp_packet: &Icmpv6Packet<'_>) {
+    pub(crate) fn process_mldv2(
+        &mut self,
+        inner: &mut StackInner,
+        dst_addr: Ipv6Addr,
+        icmp_packet: &Icmpv6Packet<'_>,
+        now: Instant,
+    ) {
         if icmp_packet.msg_code() != 0 {
             return;
         }
@@ -593,15 +599,13 @@ impl IfaceState<'_> {
         if mcast_addr.is_unspecified() && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_ip_addr(dst_addr)) {
             let ipv6_multicast_group_count = self.multicast.keys().filter(|a| matches!(a, IpAddr::V6(_))).count();
             if ipv6_multicast_group_count != 0 {
-                self.multicast.mld_report_state = MldReportState::ToGeneralQuery {
-                    timeout: inner.now + delay,
-                };
+                self.multicast.mld_report_state = MldReportState::ToGeneralQuery { timeout: now + delay };
             }
         }
         if self.has_multicast_group(mcast_addr) && dst_addr == mcast_addr {
             self.multicast.mld_report_state = MldReportState::ToSpecificQuery {
                 group: mcast_addr,
-                timeout: inner.now + delay,
+                timeout: now + delay,
             };
         }
     }

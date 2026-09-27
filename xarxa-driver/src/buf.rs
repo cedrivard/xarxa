@@ -33,6 +33,7 @@ const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
 
 const BITMAP_WORDS: usize = PACKET_BUF_COUNT.div_ceil(32);
 
+#[rustfmt::skip]
 cfg_select! {
     feature = "packet-buf-align-32" => { #[repr(C, align(32))] struct Data([u8; PACKET_BUF_SIZE]); }
     feature = "packet-buf-align-16" => { #[repr(C, align(16))] struct Data([u8; PACKET_BUF_SIZE]); }

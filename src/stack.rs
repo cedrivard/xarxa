@@ -84,7 +84,6 @@ pub(crate) struct Sockets<'d> {
 pub(crate) struct StackInner {
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) tx_timestamps: TxTimestampQueue,
-    pub(crate) now: Instant,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -301,18 +300,14 @@ impl TxContext<'_, '_> {
     #[cfg(any(feature = "udp", feature = "tcp"))]
     pub(crate) fn get_source_address(&self, binding: IfaceBinding, dst_addr: &IpAddr) -> Option<IpAddr> {
         let route = self.route(binding, dst_addr)?;
-        self.ifaces
-            .get(route.iface.index())
-            .get_source_address(dst_addr, self.inner.now)
+        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
     /// A source address for sending to `dst_addr` out of the interface `route`
     /// names.
     #[cfg(feature = "udp")]
     pub(crate) fn get_source_address_routed(&self, route: &EgressRoute, dst_addr: &IpAddr) -> Option<IpAddr> {
-        self.ifaces
-            .get(route.iface.index())
-            .get_source_address(dst_addr, self.inner.now)
+        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
     /// Whether the interface can take one more packet right now.
@@ -372,7 +367,7 @@ impl TxContext<'_, '_> {
             });
         }
 
-        let route = self.inner.routes.lookup(binding, dst_addr, self.inner.now)?;
+        let route = self.inner.routes.lookup(binding, dst_addr)?;
         Some(EgressRoute {
             iface: route.iface,
             next_hop: route.via_router,
@@ -534,7 +529,6 @@ impl<'d> Stack<'d> {
             inner: StackInner {
                 #[cfg(feature = "packetmeta-timestamp")]
                 tx_timestamps: TxTimestampQueue::new(),
-                now: Instant::ZERO,
                 rand,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -1065,12 +1059,18 @@ impl<'d> Stack<'d> {
         doc = "link state changes. `poll` then wakes the UDP and raw sockets that were waiting for that room."
     )]
     pub fn poll(&mut self, timestamp: Instant) -> Instant {
-        self.inner.now = timestamp;
+        let now = timestamp;
 
         // Everything below that has timers checks them against this clock. The ones
         // that haven't fired count toward when to poll next.
         #[allow(unused_mut)]
         let mut clock = Clock::new(timestamp);
+
+        // Expire once before doing work, so expired things aren't used.
+        // Do it with a throwaway clock to not count deadlines, since
+        // they may be changed by poll work.
+        // We do expire again before returning with the real clock.
+        self.expire(&mut Clock::new(now));
 
         // Collect the transmit timestamps the drivers have ready for us.
         #[cfg(feature = "packetmeta-timestamp")]
@@ -1084,7 +1084,7 @@ impl<'d> Stack<'d> {
             let handle = IfaceHandle::new(index);
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            self.poll_neighbor_timers(handle);
+            self.poll_neighbor_timers(handle, now);
 
             #[allow(unused_mut)]
             while let Some(mut buf) = self.ifaces.get_mut(index).driver.receive() {
@@ -1094,7 +1094,7 @@ impl<'d> Stack<'d> {
                     let medium = self.ifaces.get(index).medium();
                     crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
                 }
-                self.process(handle, buf);
+                self.process(handle, buf, now);
             }
 
             // `inner` has no user in a build with no link layer and no fragmentation.
@@ -1204,42 +1204,46 @@ impl<'d> Stack<'d> {
             }
         }
 
-        // The neighbor cache, the pending queue and the reassembly buffers get new
-        // entries anywhere in the poll, so they are done last. Every new neighbor
-        // entry is set to retransmit a fixed time from now, and the ones that were
-        // due have been retransmitted, per interface, above.
+        // Expire again with the real clock.
+        self.expire(&mut clock);
+
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        {
-            self.inner.neighbor_cache.expire(&mut clock);
-            // Drop queued packets whose neighbor resolution timed out.
-            self.inner.pending.purge_expired(&mut clock);
-        }
+        self.inner.pending.purge_orphans(&self.inner.neighbor_cache);
 
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
-
-        // Expired routes go. That isn't due at any particular time, so it doesn't
-        // count toward the deadline: a lookup checks the expiry itself.
-        self.inner.routes.remove_expired(clock.now());
 
         clock.next()
     }
 }
 
 impl<'d> Stack<'d> {
-    fn process(&mut self, iface: IfaceHandle, buf: PacketBuf) {
+    /// Expire things that need expiring:
+    /// - Remove the expired routes and neighbor entries.
+    /// - Deprecate the addresses whose preferred lifetime ran out.
+    /// - Expire neighbor cache entries.
+    fn expire(&mut self, clock: &mut Clock) {
+        self.inner.routes.remove_expired(clock);
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        self.inner.neighbor_cache.expire(clock);
+        for (_, iface) in self.ifaces.iter_mut() {
+            crate::iface::expire_preferred(&mut iface.ip_addrs, clock);
+        }
+    }
+
+    fn process(&mut self, iface: IfaceHandle, buf: PacketBuf, now: Instant) {
         match self.ifaces.get(iface.index()).medium() {
             #[cfg(feature = "medium-ethernet")]
-            Medium::Ethernet => self.process_ethernet(iface, buf),
+            Medium::Ethernet => self.process_ethernet(iface, buf, now),
             #[cfg(feature = "medium-ip")]
-            Medium::Ip => self.process_ip(iface, buf),
+            Medium::Ip => self.process_ip(iface, buf, now),
             #[cfg(feature = "medium-ieee802154")]
-            Medium::Ieee802154 => self.process_ieee802154(iface, buf),
+            Medium::Ieee802154 => self.process_ieee802154(iface, buf, now),
         }
     }
 
     #[cfg(feature = "medium-ethernet")]
-    fn process_ethernet(&mut self, iface: IfaceHandle, mut buf: PacketBuf) {
+    fn process_ethernet(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -1271,26 +1275,26 @@ impl<'d> Stack<'d> {
 
         match ethertype {
             #[cfg(feature = "ipv4")]
-            EthernetProtocol::Arp => self.inner.process_arp(self.ifaces.get_mut(iface.index()), buf),
+            EthernetProtocol::Arp => self.inner.process_arp(self.ifaces.get_mut(iface.index()), buf, now),
             #[cfg(feature = "ipv4")]
-            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf),
+            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf, now),
             #[cfg(feature = "ipv6")]
-            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(HardwareAddress::Ethernet(src_addr)), buf),
+            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(HardwareAddress::Ethernet(src_addr)), buf, now),
             // Drop all other traffic.
             _ => {}
         }
     }
 
     #[cfg(feature = "medium-ip")]
-    fn process_ip(&mut self, iface: IfaceHandle, buf: PacketBuf) {
+    fn process_ip(&mut self, iface: IfaceHandle, buf: PacketBuf, now: Instant) {
         if buf.is_empty() {
             return;
         }
         match IpVersion::of_packet(&buf) {
             #[cfg(feature = "ipv4")]
-            Ok(IpVersion::V4) => self.process_ipv4(iface, None, buf),
+            Ok(IpVersion::V4) => self.process_ipv4(iface, None, buf, now),
             #[cfg(feature = "ipv6")]
-            Ok(IpVersion::V6) => self.process_ipv6(iface, None, buf),
+            Ok(IpVersion::V6) => self.process_ipv6(iface, None, buf, now),
             Err(_) => {}
         }
     }
@@ -1299,7 +1303,8 @@ impl<'d> Stack<'d> {
     // medium never calls this.
     #[cfg(feature = "ipv4")]
     #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
-    fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: PacketBuf, now: Instant) {
+        let _ = now;
         let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
         if ipv4_packet.version() != 4 {
@@ -1312,7 +1317,7 @@ impl<'d> Stack<'d> {
         }
         #[cfg(feature = "ipv4-reassembly")]
         let mut buf = if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
-            let Some(buf) = self.reassemble_ipv4(buf) else {
+            let Some(buf) = self.reassemble_ipv4(buf, now) else {
                 return;
             };
             buf
@@ -1351,7 +1356,7 @@ impl<'d> Stack<'d> {
                 let payload = &mut buf[header_len + UDP_HEADER_LEN..header_len + udp_len];
                 self.ifaces
                     .get_mut(iface.index())
-                    .dhcpv4_process(&mut self.inner, src_addr, payload);
+                    .dhcpv4_process(&mut self.inner, src_addr, payload, now);
                 return;
             }
         }
@@ -1375,7 +1380,7 @@ impl<'d> Stack<'d> {
                 let payload = &mut buf[header_len + UDP_HEADER_LEN..header_len + udp_len];
                 self.ifaces
                     .get_mut(iface.index())
-                    .dhcpv4_server_process(&mut self.inner, src_addr, payload);
+                    .dhcpv4_server_process(&mut self.inner, src_addr, payload, now);
                 return;
             }
         }
@@ -1402,7 +1407,7 @@ impl<'d> Stack<'d> {
                 self.inner.neighbor_cache.reset_expiry_if_existing(
                     (iface.handle, IpAddr::V4(src_addr)),
                     HardwareAddress::Ethernet(eth_src),
-                    self.inner.now,
+                    now,
                 );
             }
             #[cfg(not(feature = "medium-ethernet"))]
@@ -1434,10 +1439,7 @@ impl<'d> Stack<'d> {
         match next_header {
             IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
             #[cfg(feature = "multicast")]
-            IpProtocol::Igmp => self
-                .ifaces
-                .get_mut(iface.index())
-                .process_igmp(&mut self.inner, dst_addr, buf),
+            IpProtocol::Igmp => self.ifaces.get_mut(iface.index()).process_igmp(dst_addr, buf, now),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
@@ -1448,7 +1450,7 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), buf),
+            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), buf, now),
             _ => {
                 trace!("ipv4: protocol {} not supported", next_header);
                 // ICMP protocol unreachable (RFC 792): restore the IP header so the
@@ -1475,7 +1477,14 @@ impl<'d> Stack<'d> {
     /// The socket's own transmissions (data, ACKs of received data) are not sent
     /// here. [`Stack::poll`] drives them right after ingress processing.
     #[cfg(feature = "tcp")]
-    fn process_tcp(&mut self, iface: IfaceHandle, src_addr: IpAddr, dst_addr: IpAddr, mut buf: PacketBuf) {
+    fn process_tcp(
+        &mut self,
+        iface: IfaceHandle,
+        src_addr: IpAddr,
+        dst_addr: IpAddr,
+        mut buf: PacketBuf,
+        now: Instant,
+    ) {
         // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
         // or destination in any IP datagram. Drop such TCP segments early to avoid
         // creating sockets with unspecified peers (which would later panic on egress).
@@ -1504,7 +1513,7 @@ impl<'d> Stack<'d> {
         for (_, socket) in self.sockets.tcp.iter_mut() {
             if socket.binding_matches(iface) && socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 matched = true;
-                reply_repr = socket.process(self.inner.now, &src_addr, &dst_addr, &tcp_repr);
+                reply_repr = socket.process(now, &src_addr, &dst_addr, &tcp_repr);
                 break;
             }
         }
@@ -1666,7 +1675,13 @@ impl<'d> Stack<'d> {
     /// `ll_src` is the link-layer source address of the frame the packet arrived
     /// in, `None` on a medium without link-layer addresses.
     #[cfg(feature = "ipv6")]
-    pub(crate) fn process_ipv6(&mut self, iface: IfaceHandle, ll_src: Option<HardwareAddress>, mut buf: PacketBuf) {
+    pub(crate) fn process_ipv6(
+        &mut self,
+        iface: IfaceHandle,
+        ll_src: Option<HardwareAddress>,
+        mut buf: PacketBuf,
+        now: Instant,
+    ) {
         let ipv6_packet = check!(Ipv6Packet::new_checked(&mut buf));
 
         if ipv6_packet.version() != 6 {
@@ -1696,11 +1711,9 @@ impl<'d> Stack<'d> {
             if let Some(ll_src) = ll_src
                 && dst_addr.x_is_unicast()
             {
-                self.inner.neighbor_cache.reset_expiry_if_existing(
-                    (iface.handle, IpAddr::V6(src_addr)),
-                    ll_src,
-                    self.inner.now,
-                );
+                self.inner
+                    .neighbor_cache
+                    .reset_expiry_if_existing((iface.handle, IpAddr::V6(src_addr)), ll_src, now);
             }
         }
 
@@ -1755,7 +1768,7 @@ impl<'d> Stack<'d> {
         buf.pull_front(l4_offset);
 
         match next_header {
-            IpProtocol::Icmpv6 => self.process_icmpv6(iface, ll_src, src_addr, dst_addr, hop_limit, buf),
+            IpProtocol::Icmpv6 => self.process_icmpv6(iface, ll_src, src_addr, dst_addr, hop_limit, buf, now),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
@@ -1766,7 +1779,7 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), buf),
+            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), buf, now),
             _ => {
                 trace!("ipv6: protocol {} not supported", next_header);
                 // ICMPv6 parameter problem, unrecognized next header (RFC 4443
@@ -1795,9 +1808,10 @@ impl<'d> Stack<'d> {
         dst_addr: Ipv6Addr,
         hop_limit: u8,
         mut buf: PacketBuf,
+        now: Instant,
     ) {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
-        let _ = (ll_src, hop_limit);
+        let _ = (ll_src, hop_limit, now);
         #[cfg(not(feature = "icmp-ping-reply"))]
         let _ = iface;
 
@@ -1819,9 +1833,7 @@ impl<'d> Stack<'d> {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
                 } else {
-                    self.ifaces
-                        .get(iface.index())
-                        .get_source_address_ipv6(&src_addr, self.inner.now)
+                    self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
                 };
 
                 // Route first: the reply's checksum is the egress interface's to
@@ -1871,14 +1883,20 @@ impl<'d> Stack<'d> {
             // NDISC is only processed if the packet arrived with the un-decremented
             // hop limit, and only on mediums with link-layer addresses.
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && ll_src.is_some() => self
-                .inner
-                .process_ndisc_solicit(self.ifaces.get_mut(iface.index()), src_addr, dst_addr, &mut icmp_packet),
+            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && ll_src.is_some() => {
+                self.inner.process_ndisc_solicit(
+                    self.ifaces.get_mut(iface.index()),
+                    src_addr,
+                    dst_addr,
+                    &mut icmp_packet,
+                    now,
+                )
+            }
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             Icmpv6Message::NeighborAdvert if hop_limit == 0xff && ll_src.is_some() => {
                 self.inner
-                    .process_ndisc_advert(self.ifaces.get_mut(iface.index()), dst_addr, &mut icmp_packet)
+                    .process_ndisc_advert(self.ifaces.get_mut(iface.index()), dst_addr, &mut icmp_packet, now)
             }
 
             // [RFC 3810 § 6.2], reception checks
@@ -1886,7 +1904,7 @@ impl<'d> Stack<'d> {
             Icmpv6Message::MldQuery if hop_limit == 1 && src_addr.is_link_local() => self
                 .ifaces
                 .get_mut(iface.index())
-                .process_mldv2(&mut self.inner, dst_addr, &icmp_packet),
+                .process_mldv2(&mut self.inner, dst_addr, &icmp_packet, now),
 
             // RFC 4861 §6.1.2: a router advertisement is only valid from a link-local
             // source, with the un-decremented hop limit.
@@ -1901,6 +1919,7 @@ impl<'d> Stack<'d> {
                     &mut self.inner,
                     src_addr,
                     &mut icmp_packet,
+                    now,
                 )
             }
 
@@ -1912,13 +1931,9 @@ impl<'d> Stack<'d> {
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn poll_neighbor_timers(&mut self, iface: IfaceHandle) {
+    fn poll_neighbor_timers(&mut self, iface: IfaceHandle, now: Instant) {
         let mut cursor = 0;
-        while let Some(event) = self
-            .inner
-            .neighbor_cache
-            .poll_retransmit(iface, self.inner.now, &mut cursor)
-        {
+        while let Some(event) = self.inner.neighbor_cache.poll_retransmit(iface, now, &mut cursor) {
             match event {
                 ProbeEvent::Retransmit(addr) => {
                     debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
@@ -1930,7 +1945,7 @@ impl<'d> Stack<'d> {
                     // resolution with an ICMP destination unreachable error.
                     #[cfg(feature = "icmp-errors")]
                     while let Some(packet) = self.inner.pending.pop_matching(&(iface, addr)) {
-                        self.deliver_neighbor_failure_error(iface, packet.buf);
+                        self.deliver_neighbor_failure_error(iface, packet.buf, now);
                     }
                     #[cfg(not(feature = "icmp-errors"))]
                     while self.inner.pending.pop_matching(&(iface, addr)).is_some() {}
@@ -1951,7 +1966,7 @@ impl<'d> Stack<'d> {
         any(feature = "medium-ethernet", feature = "medium-ieee802154"),
         feature = "icmp-errors"
     ))]
-    fn deliver_neighbor_failure_error(&mut self, iface: IfaceHandle, mut orig: PacketBuf) {
+    fn deliver_neighbor_failure_error(&mut self, iface: IfaceHandle, mut orig: PacketBuf, now: Instant) {
         match IpVersion::of_packet(&orig) {
             #[cfg(feature = "ipv4")]
             Ok(IpVersion::V4) => {
@@ -1987,7 +2002,7 @@ impl<'d> Stack<'d> {
                     return;
                 };
                 push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
-                self.process_ipv4(iface, None, reply);
+                self.process_ipv4(iface, None, reply, now);
             }
             #[cfg(feature = "ipv6")]
             Ok(IpVersion::V6) => {
@@ -2006,10 +2021,7 @@ impl<'d> Stack<'d> {
                 if !src_addr.x_is_unicast() {
                     return;
                 }
-                let reply_src = self
-                    .ifaces
-                    .get(iface.index())
-                    .get_source_address_ipv6(&src_addr, self.inner.now);
+                let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
                 let Some(mut reply) = build_icmpv6_error(
@@ -2024,7 +2036,7 @@ impl<'d> Stack<'d> {
                     return;
                 };
                 push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
-                self.process_ipv6(iface, None, reply);
+                self.process_ipv6(iface, None, reply, now);
             }
             Err(_) => {}
         }
@@ -2099,9 +2111,7 @@ impl<'d> Stack<'d> {
         let reply_src = if dst_addr.x_is_unicast() {
             dst_addr
         } else {
-            self.ifaces
-                .get(iface.index())
-                .get_source_address_ipv6(&src_addr, self.inner.now)
+            self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
         };
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V6(src_addr)) else {
             return;
@@ -2160,7 +2170,7 @@ impl<'d> Stack<'d> {
 // because they serve both ingress (above) and socket egress (`TxContext`).
 impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf) {
+    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf, now: Instant) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -2206,6 +2216,7 @@ impl StackInner {
             iface,
             IpAddr::V4(source_protocol_addr),
             HardwareAddress::Ethernet(source_hardware_addr),
+            now,
         );
 
         if operation == ArpOperation::Request {
@@ -2240,6 +2251,7 @@ impl StackInner {
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
         icmp_packet: &mut Icmpv6Packet<'_>,
+        now: Instant,
     ) {
         if icmp_packet.msg_code() != 0 {
             return;
@@ -2253,7 +2265,7 @@ impl StackInner {
             if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                 return;
             }
-            self.fill_neighbor(iface, IpAddr::V6(src_addr), lladdr);
+            self.fill_neighbor(iface, IpAddr::V6(src_addr), lladdr, now);
         }
 
         // RFC 4861 §7.2.3: the destination is either the target's solicited-node
@@ -2307,6 +2319,7 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: Ipv6Addr,
         icmp_packet: &mut Icmpv6Packet<'_>,
+        now: Instant,
     ) {
         // Validation, RFC 4861 §7.1.2. Hop limit and length were checked by the caller.
         if icmp_packet.msg_code() != 0 {
@@ -2342,7 +2355,7 @@ impl StackInner {
                 let Some(lladdr) = lladdr else {
                     return;
                 };
-                self.fill_neighbor(iface, ip_addr, lladdr);
+                self.fill_neighbor(iface, ip_addr, lladdr, now);
             }
             NeighborState::Reachable {
                 hardware_addr: cached, ..
@@ -2356,7 +2369,7 @@ impl StackInner {
                 // §7.2.5 II: a supplied address is inserted, and a solicited
                 // advertisement confirms reachability.
                 if lladdr != cached || flags.contains(NdiscNeighborFlags::SOLICITED) {
-                    self.fill_neighbor(iface, ip_addr, lladdr);
+                    self.fill_neighbor(iface, ip_addr, lladdr, now);
                 }
             }
         }
@@ -2380,9 +2393,15 @@ impl StackInner {
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    pub(crate) fn fill_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddr, hardware_addr: HardwareAddress) {
+    pub(crate) fn fill_neighbor(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        addr: IpAddr,
+        hardware_addr: HardwareAddress,
+        now: Instant,
+    ) {
         let key = (iface.handle, addr);
-        self.neighbor_cache.fill(key, hardware_addr, self.now);
+        self.neighbor_cache.fill(key, hardware_addr, now);
         // This runs during ingress. What stays parked is retried later in the same
         // poll, by `flush_resolved_pending`.
         let _ = self.flush_pending(iface, &key, hardware_addr);
@@ -2449,7 +2468,7 @@ impl StackInner {
     pub(crate) fn flush_resolved_pending(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         let mut cursor = 0;
         while let Some((index, key)) = self.pending.next_on(iface.handle, cursor) {
-            match self.neighbor_cache.lookup(&key, self.now) {
+            match self.neighbor_cache.lookup(&key) {
                 NeighborAnswer::Found(hardware_addr) => {
                     // Out of room. Everything else waits too.
                     self.flush_pending(iface, &key, hardware_addr)?;
@@ -2501,7 +2520,7 @@ impl StackInner {
             return NeighborLookup::Found(hardware_addr);
         }
 
-        match self.neighbor_cache.lookup(&(iface.handle, next_hop), self.now) {
+        match self.neighbor_cache.lookup(&(iface.handle, next_hop)) {
             NeighborAnswer::Found(hardware_addr) => return NeighborLookup::Found(hardware_addr),
             // Resolution is already in progress; the retransmission timer owns
             // any further solicitations.
@@ -2511,7 +2530,7 @@ impl StackInner {
 
         // Start resolving: create the INCOMPLETE entry and send the first solicitation.
         debug!("address {} not in neighbor cache, sending solicitation", next_hop);
-        self.neighbor_cache.start_resolution((iface.handle, next_hop), self.now);
+        self.neighbor_cache.start_resolution((iface.handle, next_hop));
         self.solicit_neighbor(iface, next_hop);
 
         NeighborLookup::Pending { next_hop }
@@ -2552,7 +2571,7 @@ impl StackInner {
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) {
         use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
-        let src_addr = iface.get_source_address_ipv6(&target_addr, self.now);
+        let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
@@ -2644,7 +2663,7 @@ impl StackInner {
             dst
         } else {
             self.routes
-                .lookup(IfaceBinding::Any, &dst, self.now)
+                .lookup(IfaceBinding::Any, &dst)
                 .map(|route| route.via_router)
                 .unwrap_or(dst)
         };
@@ -2707,7 +2726,7 @@ impl StackInner {
                 }
                 NeighborLookup::Pending { next_hop } => {
                     debug!("neighbor {} pending, queing packet", next_hop);
-                    self.pending.push((iface.handle, next_hop), buf, self.now);
+                    self.pending.push((iface.handle, next_hop), buf);
                 }
             },
             #[cfg(feature = "medium-ieee802154")]
@@ -2724,7 +2743,7 @@ impl StackInner {
                     }
                     NeighborLookup::Pending { next_hop } => {
                         debug!("neighbor {} pending, queing packet", next_hop);
-                        self.pending.push((iface.handle, next_hop), buf, self.now);
+                        self.pending.push((iface.handle, next_hop), buf);
                     }
                 }
             }
@@ -3027,7 +3046,7 @@ pub(crate) mod test {
     use crate::driver::ChecksumOffload;
     #[cfg(feature = "slaac")]
     use crate::iface::slaac::{SlaacConfig, SlaacState};
-    use crate::iface::{AddrOrigin, IfaceAddr};
+    use crate::iface::{AddrOrigin, IfaceAddr, Preferred};
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
     #[cfg(feature = "slaac")]
@@ -3141,7 +3160,7 @@ pub(crate) mod test {
         let ll = IfaceAddr {
             cidr: IpCidr::new(OUR_LINK_LOCAL.into(), 64),
             origin: AddrOrigin::LinkLocal,
-            preferred_until: None,
+            preferred: Preferred::Always,
         };
         let (mut stack, _rx, _tx) = test_stack(Medium::Ethernet);
         let handle = IfaceHandle::new(0);
@@ -3303,13 +3322,14 @@ pub(crate) mod test {
         ));
         let deadline = stack.poll(now);
         assert_eq!(tx.borrow().len(), 2);
-        assert_eq!(deadline, now + Duration::from_secs(1800));
+        // The router's neighbor entry expires first, then the route.
+        assert_eq!(deadline, now + crate::neighbor::NeighborCache::ENTRY_LIFETIME);
         // The address carries the advertised preferred lifetime, so a consumer can
         // tell a fresh address from one whose prefix is being retired.
         assert!(stack.iface(iface).ip_addrs().contains(&IfaceAddr {
             cidr: our_addr,
             origin: AddrOrigin::Slaac,
-            preferred_until: Some(now + Duration::from_secs(3600)),
+            preferred: Preferred::Until(now + Duration::from_secs(3600)),
         }));
         let route = stack.routes().default_ipv6_route().unwrap();
         assert_eq!(route.via_router, IpAddr::V6(router_ll));
@@ -3355,7 +3375,7 @@ pub(crate) mod test {
             Duration::from_secs(3600),
         ));
         let deadline = stack.poll(now);
-        assert_eq!(deadline, now + Duration::from_secs(1800));
+        assert_eq!(deadline, now + crate::neighbor::NeighborCache::ENTRY_LIFETIME);
         let route = stack.routes().default_ipv6_route().unwrap();
         assert_eq!(route.expires_at, Some(now + Duration::from_secs(1800)));
 
@@ -3365,6 +3385,16 @@ pub(crate) mod test {
         assert!(stack.routes().default_ipv6_route().is_none());
         assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
         assert_ne!(stack.iface(iface).config_generation(), generation);
+        // Then the address stops being preferred, and later goes.
+        assert_eq!(deadline, now + Duration::from_secs(3600));
+        let deadline = stack.poll(now + Duration::from_secs(3600));
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr == our_addr && a.preferred == Preferred::Never)
+        );
         assert_eq!(deadline, now + Duration::from_secs(7200));
         let deadline = stack.poll(now + Duration::from_secs(7201));
         assert!(!stack.iface(iface).has_ip_addr(our_addr.address()));
@@ -3463,7 +3493,7 @@ pub(crate) mod test {
                 .iface(iface)
                 .ip_addrs()
                 .iter()
-                .any(|a| a.cidr == our_addr && a.origin == AddrOrigin::Manual && a.preferred_until.is_none()),
+                .any(|a| a.cidr == our_addr && a.origin == AddrOrigin::Manual && a.preferred == Preferred::Always),
             "the address stays the application's, and gains no advertised lifetime"
         );
 
@@ -3483,7 +3513,7 @@ pub(crate) mod test {
                 .iface(iface)
                 .ip_addrs()
                 .iter()
-                .any(|a| a.cidr == our_addr && a.is_preferred(now)),
+                .any(|a| a.cidr == our_addr && a.is_preferred()),
             "a retired prefix must not deprecate an address slaac does not own"
         );
 
@@ -3536,9 +3566,9 @@ pub(crate) mod test {
             ));
         }
         stack.poll(now);
-        assert!(stack.iface(iface).ip_addrs().iter().all(|a| a.is_preferred(now)));
+        assert!(stack.iface(iface).ip_addrs().iter().all(|a| a.is_preferred()));
         assert_eq!(
-            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst, now),
+            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst),
             outgoing_addr
         );
 
@@ -3560,12 +3590,12 @@ pub(crate) mod test {
                 .iface(iface)
                 .ip_addrs()
                 .iter()
-                .any(|a| a.cidr.address() == IpAddr::V6(outgoing_addr) && !a.is_preferred(now)),
+                .any(|a| a.cidr.address() == IpAddr::V6(outgoing_addr) && !a.is_preferred()),
             "a deprecated address stays assigned until its valid lifetime ends"
         );
         // ...and it is no longer what the stack puts in the source field.
         assert_eq!(
-            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst, now),
+            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst),
             incoming_addr
         );
     }
@@ -3620,17 +3650,14 @@ pub(crate) mod test {
                 .iface(iface)
                 .ip_addrs()
                 .iter()
-                .any(|a| a.cidr.address() == IpAddr::V6(outgoing_addr) && !a.is_preferred(now)),
+                .any(|a| a.cidr.address() == IpAddr::V6(outgoing_addr) && !a.is_preferred()),
             "the outgoing prefix's address has to be deprecated for this test to mean anything"
         );
 
         // Talking to the deprecated address itself. Rule 1 matches it exactly, so rule 3
         // must not go on to prefer the address that replaced it.
         assert_eq!(
-            stack
-                .ifaces
-                .get(iface.index())
-                .get_source_address_ipv6(&outgoing_addr, now),
+            stack.ifaces.get(iface.index()).get_source_address_ipv6(&outgoing_addr),
             outgoing_addr,
             "rule 3 must not override rule 1"
         );
@@ -4751,7 +4778,7 @@ pub(crate) mod test {
         );
     }
 
-    /// An expired route is not used, and the next poll removes it.
+    /// A route's expiry is a deadline, and the poll at it removes the route.
     #[test]
     fn test_expired_route_removed() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
@@ -4761,13 +4788,12 @@ pub(crate) mod test {
         };
         stack.routes_mut().add(route).unwrap();
         let dst = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        stack.poll(Instant::ZERO);
-        assert!(stack.routes().lookup(IfaceBinding::Any, &dst, Instant::ZERO).is_some());
-
         let expired = Instant::from_secs(1);
-        assert!(stack.routes().lookup(IfaceBinding::Any, &dst, expired).is_none());
-        assert_eq!(stack.routes().len(), 1);
+        assert_eq!(stack.poll(Instant::ZERO), expired);
+        assert!(stack.routes().lookup(IfaceBinding::Any, &dst).is_some());
+
         stack.poll(expired);
+        assert!(stack.routes().lookup(IfaceBinding::Any, &dst).is_none());
         assert!(stack.routes().is_empty());
     }
 
@@ -5287,13 +5313,13 @@ pub(crate) mod test {
 
         room.set(Some(0));
         let _ = stack.poll(Instant::ZERO);
-        let deadline = dns.poll(&mut stack);
+        let deadline = dns.poll(&mut stack, Instant::ZERO);
         assert!(tx.borrow().is_empty());
         assert_eq!(dns.get_query_result(query), Err(GetQueryResultError::Pending));
 
         room.set(None);
         let _ = stack.poll(deadline);
-        let _ = dns.poll(&mut stack);
+        let _ = dns.poll(&mut stack, deadline);
         assert_eq!(tx.borrow().len(), 1);
         assert_eq!(dns.get_query_result(query), Err(GetQueryResultError::Pending));
     }
@@ -5315,7 +5341,7 @@ pub(crate) mod test {
         let mut sent = Vec::new();
         let mut now = Instant::ZERO;
         while now <= Instant::from_secs(10) {
-            let deadline = stack.poll(now).min(dns.poll(&mut stack));
+            let deadline = stack.poll(now).min(dns.poll(&mut stack, now));
             for mut packet in tx.borrow_mut().drain(..) {
                 sent.push((now, Ipv4Packet::new_checked(&mut packet[..]).unwrap().dst_addr()));
             }
@@ -5389,9 +5415,13 @@ pub(crate) mod test {
             .unwrap();
         stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
 
+        // Nothing is due but the expiry of the neighbor entry learned at 0.
         room.set(Some(0));
         for secs in 0..5 {
-            assert_eq!(stack.poll(Instant::from_secs(secs)), Instant::MAX);
+            assert_eq!(
+                stack.poll(Instant::from_secs(secs)),
+                Instant::ZERO + crate::neighbor::NeighborCache::ENTRY_LIFETIME
+            );
         }
         assert!(tx.borrow().is_empty());
         assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
@@ -5428,16 +5458,22 @@ pub(crate) mod test {
         assert_eq!(stack.poll(Instant::ZERO), Instant::from_secs(10));
 
         // It fires: the connection is aborted, and nothing is due until the
-        // device has room.
+        // device has room, but the expiry of the neighbor entry learned at 0.
         let now = Instant::from_secs(10);
         stack.poll(now);
         assert_eq!(stack.tcp_socket(handle).state(), TcpState::Closed);
-        assert_eq!(stack.poll(now), Instant::MAX);
+        assert_eq!(
+            stack.poll(now),
+            Instant::ZERO + crate::neighbor::NeighborCache::ENTRY_LIFETIME
+        );
         assert!(tx.borrow().is_empty());
 
         // With room, the RST goes out, and the socket forgets the connection.
         room.set(Some(1));
-        assert_eq!(stack.poll(now), Instant::MAX);
+        assert_eq!(
+            stack.poll(now),
+            Instant::ZERO + crate::neighbor::NeighborCache::ENTRY_LIFETIME
+        );
         assert_eq!(tx.borrow().len(), 1);
         assert_eq!(stack.tcp_socket(handle).remote_addr(), None);
     }
@@ -6978,7 +7014,7 @@ pub(crate) mod test {
             ])
             .unwrap();
         let iface = stack.ifaces.get(0);
-        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst, Instant::ZERO);
+        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst);
         assert_eq!(pick(Ipv6Addr::LOCALHOST), Ipv6Addr::LOCALHOST);
         assert_eq!(pick(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x42)), ll);
         assert_eq!(pick(Ipv6Addr::new(0xfd00, 0, 0, 0x201, 1, 1, 1, 1)), ula_0);
@@ -6992,7 +7028,7 @@ pub(crate) mod test {
         // Only a link-local address: it serves every destination.
         stack.iface(handle).set_ip_addrs([IpCidr::new(ll.into(), 64)]).unwrap();
         let iface = stack.ifaces.get(0);
-        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst, Instant::ZERO);
+        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst);
         assert_eq!(pick(Ipv6Addr::LOCALHOST), Ipv6Addr::LOCALHOST);
         for dst in [
             Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x42),
@@ -7009,7 +7045,7 @@ pub(crate) mod test {
         // No addresses: the loopback address is the only candidate.
         stack.iface(handle).set_ip_addrs(Vec::<IpCidr>::new()).unwrap();
         let iface = stack.ifaces.get(0);
-        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst, Instant::ZERO);
+        let pick = |dst: Ipv6Addr| iface.get_source_address_ipv6(&dst);
         for dst in [
             Ipv6Addr::LOCALHOST,
             Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x42),

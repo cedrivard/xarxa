@@ -19,9 +19,6 @@ pub(crate) type Key = (IfaceHandle, IpAddr);
 // make room). Both are compile-time knobs.
 pub(crate) use crate::config::{NEIGHBOR_CACHE_COUNT, PENDING_QUEUE_COUNT};
 
-/// How long a packet may sit in the pending queue before it is dropped.
-pub(crate) const PENDING_QUEUE_LIFETIME: Duration = Duration::from_millis(5_000);
-
 /// Maximum number of solicitations sent for one resolution before giving up.
 /// (RFC 4861 MAX_MULTICAST_SOLICIT)
 pub(crate) const MAX_MULTICAST_SOLICIT: u8 = 3;
@@ -33,6 +30,9 @@ pub(crate) const RETRANS_TIMER: Duration = Duration::from_millis(1_000);
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 enum State {
+    /// Address resolution started, and the first solicitation went out, since the
+    /// last poll. The poll sets the retransmission timer.
+    Started,
     /// Address resolution is in progress: solicitations are being sent, no answer
     /// yet. Egress packets for this neighbor are queued in the [PendingQueue]
     /// meanwhile.
@@ -58,7 +58,7 @@ enum State {
 impl From<State> for NeighborState {
     fn from(state: State) -> Self {
         match state {
-            State::Incomplete { .. } => NeighborState::Incomplete,
+            State::Incomplete { .. } | State::Started => NeighborState::Incomplete,
             State::Reachable {
                 hardware_addr,
                 expires_at,
@@ -166,33 +166,29 @@ impl NeighborCache {
         }
     }
 
-    pub(crate) fn lookup(&self, key: &Key, timestamp: Instant) -> Answer {
+    /// Look up a neighbor.
+    ///
+    /// The time isn't looked at: [`expire`](Self::expire) runs at the start of
+    /// every poll, and the expiries count toward the poll deadline.
+    pub(crate) fn lookup(&self, key: &Key) -> Answer {
         assert!(key.1.is_unicast());
 
         match self.get_state(key) {
-            Some(State::Reachable {
-                hardware_addr,
-                expires_at,
-            }) if timestamp < expires_at => Answer::Found(hardware_addr),
-            Some(State::Incomplete { .. }) => Answer::Pending,
+            Some(State::Reachable { hardware_addr, .. }) => Answer::Found(hardware_addr),
+            Some(State::Incomplete { .. } | State::Started) => Answer::Pending,
             _ => Answer::NotFound,
         }
     }
 
     /// Create an INCOMPLETE entry for a neighbor, starting address resolution.
     ///
-    /// The caller sends the first solicitation itself; the entry's retransmission
-    /// timer takes over from there (see [NeighborCache::poll_retransmit]).
-    pub(crate) fn start_resolution(&mut self, key: Key, timestamp: Instant) {
+    /// The caller sends the first solicitation itself. The end of the next poll
+    /// (or the current one) sets the retransmission timer, which takes over from
+    /// there (see [NeighborCache::poll_retransmit]).
+    pub(crate) fn start_resolution(&mut self, key: Key) {
         debug_assert!(key.1.is_unicast());
 
-        self.insert_state(
-            key,
-            State::Incomplete {
-                probes_sent: 1,
-                retrans_at: timestamp + RETRANS_TIMER,
-            },
-        );
+        self.insert_state(key, State::Started);
     }
 
     /// Advance the retransmission timers of the neighbors being resolved on `iface`,
@@ -235,21 +231,35 @@ impl NeighborCache {
         None
     }
 
-    /// Make the entries that expired stale, and count the retransmission timers
-    /// toward the next deadline. Every retransmission timer must be later than
-    /// now.
+    /// Make the entries that expired stale, set the retransmission timer of the
+    /// resolutions started since the last call, and count every timer and expiry
+    /// that hasn't passed toward the next deadline.
     ///
-    /// An expiry doesn't count toward the deadline: nothing is due then, a lookup
-    /// checks it itself.
+    /// The poll calls this at its start, before anything in it looks a neighbor
+    /// up, and at its end, after everything that can start a resolution or fill
+    /// an entry. Only the end call's deadline counts.
     pub(crate) fn expire(&mut self, clock: &mut Clock) {
         for (_, state) in self.storage.iter_mut() {
             match *state {
-                State::Incomplete { retrans_at, .. } => clock.schedule(retrans_at),
+                State::Started => {
+                    *state = State::Incomplete {
+                        probes_sent: 1,
+                        retrans_at: clock.after(RETRANS_TIMER),
+                    }
+                }
+                // A due one is retransmitted per interface, after the start call.
+                State::Incomplete { retrans_at, .. } => {
+                    clock.expired(retrans_at);
+                }
                 State::Reachable {
                     hardware_addr,
                     expires_at,
-                } if expires_at <= clock.now() => *state = State::Stale { hardware_addr },
-                State::Reachable { .. } | State::Stale { .. } => {}
+                } => {
+                    if clock.expired(expires_at) {
+                        *state = State::Stale { hardware_addr };
+                    }
+                }
+                State::Stale { .. } => {}
             }
         }
     }
@@ -296,7 +306,7 @@ impl NeighborCache {
                 trace!("replaced {} => {} (was {})", key.1, hardware_addr, old_hardware_addr);
             }
             Some(State::Reachable { .. } | State::Stale { .. }) => {}
-            Some(State::Incomplete { .. }) => {
+            Some(State::Incomplete { .. } | State::Started) => {
                 trace!("filled {} => {} (was incomplete)", key.1, hardware_addr);
             }
             None => {
@@ -368,9 +378,8 @@ impl NeighborCache {
 
     /// Remove the entry for a neighbor, returning it if there was one.
     ///
-    /// Removing an entry whose resolution is still in progress leaves the
-    /// packets parked on it waiting: they are dropped when their own timeout
-    /// expires, a few seconds later.
+    /// Removing an entry whose resolution is still in progress drops the packets
+    /// parked on it at the next poll.
     pub fn remove(&mut self, iface: IfaceHandle, addr: IpAddr) -> Option<Neighbor> {
         let index = self.storage.iter().position(|(key, _)| *key == (iface, addr))?;
         let ((iface, addr), state) = self.storage.swap_remove(index);
@@ -432,6 +441,7 @@ impl NeighborCache {
                     State::Stale { .. } => (0u8, Instant::ZERO),
                     State::Reachable { expires_at, .. } => (1u8, *expires_at),
                     State::Incomplete { retrans_at, .. } => (2u8, *retrans_at),
+                    State::Started => (3u8, Instant::ZERO),
                 };
                 if rank < best {
                     best = rank;
@@ -465,7 +475,6 @@ impl NeighborCache {
 pub(crate) struct PendingPacket {
     pub key: Key,
     pub buf: PacketBuf,
-    pub expires_at: Instant,
 }
 
 /// A queue of egress packets waiting for neighbor resolution.
@@ -488,12 +497,8 @@ impl PendingQueue {
     }
 
     /// Queue a packet waiting for `key` to resolve.
-    pub fn push(&mut self, key: Key, buf: PacketBuf, timestamp: Instant) {
-        let packet = PendingPacket {
-            key,
-            buf,
-            expires_at: timestamp + PENDING_QUEUE_LIFETIME,
-        };
+    pub fn push(&mut self, key: Key, buf: PacketBuf) {
+        let packet = PendingPacket { key, buf };
         if let Err(packet) = self.packets.push(packet) {
             trace!("neighbor: pending queue full, dropping oldest packet");
             self.packets.remove(0);
@@ -524,18 +529,24 @@ impl PendingQueue {
         Some(self.packets.remove(index))
     }
 
-    /// Drop packets that have waited too long.
-    pub fn purge_expired(&mut self, clock: &mut Clock) {
+    /// Drop the packets whose resolution is gone: the entry was removed or
+    /// evicted, or it resolved and went stale before the device took them.
+    ///
+    /// Otherwise a packet leaves the queue when its resolution succeeds or fails
+    /// (RFC 4861 §7.2.2), so it needs no timer of its own.
+    pub fn purge_orphans(&mut self, cache: &NeighborCache) {
         self.packets.retain(|packet| {
-            if clock.expired(packet.expires_at) {
+            let keep = matches!(
+                cache.get_state(&packet.key),
+                Some(State::Started | State::Incomplete { .. } | State::Reachable { .. })
+            );
+            if !keep {
                 trace!(
-                    "neighbor: dropping queued packet for {}, resolution timed out",
+                    "neighbor: dropping queued packet for {}, its resolution is gone",
                     packet.key.1
                 );
-                false
-            } else {
-                true
             }
+            keep
         });
     }
 
@@ -584,7 +595,7 @@ mod test {
         let mut cache = NeighborCache::new();
         cache.fill(key(MOCK_IP_ADDR_1), addr, Instant::from_millis(0));
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(addr)
         );
     }
@@ -619,7 +630,7 @@ mod test {
         cache.insert(IF_0, MOCK_IP_ADDR_1.into(), HADDR_A, expires_at).unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(HADDR_A)
         );
     }
@@ -637,15 +648,15 @@ mod test {
     fn test_fill() {
         let mut cache = NeighborCache::new();
 
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)).found());
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_2), Instant::from_millis(0)).found());
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)).found());
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_2), Instant::from_millis(0)).found());
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::from_millis(0));
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(HADDR_A)
         );
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_2), Instant::from_millis(0)).found());
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_2), Instant::from_millis(0)).found());
     }
 
     #[test]
@@ -654,17 +665,11 @@ mod test {
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::from_millis(0));
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(HADDR_A)
         );
-        assert!(
-            !cache
-                .lookup(
-                    &key(MOCK_IP_ADDR_1),
-                    Instant::from_millis(0) + NeighborCache::ENTRY_LIFETIME * 2
-                )
-                .found(),
-        );
+        let later = Instant::from_millis(0) + NeighborCache::ENTRY_LIFETIME * 2;
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), later).found());
     }
 
     #[test]
@@ -673,12 +678,12 @@ mod test {
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::from_millis(0));
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(HADDR_A)
         );
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_B, Instant::from_millis(0));
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
             Answer::Found(HADDR_B)
         );
     }
@@ -690,21 +695,12 @@ mod test {
         // The same protocol address resolves independently on different interfaces.
         cache.fill((IF_0, MOCK_IP_ADDR_1.into()), HADDR_A, Instant::ZERO);
         cache.fill((IF_1, MOCK_IP_ADDR_1.into()), HADDR_B, Instant::ZERO);
-        assert_eq!(
-            cache.lookup(&(IF_0, MOCK_IP_ADDR_1.into()), Instant::ZERO),
-            Answer::Found(HADDR_A)
-        );
-        assert_eq!(
-            cache.lookup(&(IF_1, MOCK_IP_ADDR_1.into()), Instant::ZERO),
-            Answer::Found(HADDR_B)
-        );
+        assert_eq!(cache.lookup(&(IF_0, MOCK_IP_ADDR_1.into())), Answer::Found(HADDR_A));
+        assert_eq!(cache.lookup(&(IF_1, MOCK_IP_ADDR_1.into())), Answer::Found(HADDR_B));
 
         cache.clear_iface(IF_0);
-        assert!(!cache.lookup(&(IF_0, MOCK_IP_ADDR_1.into()), Instant::ZERO).found());
-        assert_eq!(
-            cache.lookup(&(IF_1, MOCK_IP_ADDR_1.into()), Instant::ZERO),
-            Answer::Found(HADDR_B)
-        );
+        assert!(!cache.lookup(&(IF_0, MOCK_IP_ADDR_1.into())).found());
+        assert_eq!(cache.lookup(&(IF_1, MOCK_IP_ADDR_1.into())), Answer::Found(HADDR_B));
     }
 
     #[test]
@@ -713,20 +709,14 @@ mod test {
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::ZERO);
         cache.fill((IF_1, MOCK_IP_ADDR_2.into()), HADDR_B, Instant::ZERO);
-        assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::ZERO),
-            Answer::Found(HADDR_A)
-        );
-        assert_eq!(
-            cache.lookup(&(IF_1, MOCK_IP_ADDR_2.into()), Instant::ZERO),
-            Answer::Found(HADDR_B)
-        );
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Found(HADDR_A));
+        assert_eq!(cache.lookup(&(IF_1, MOCK_IP_ADDR_2.into())), Answer::Found(HADDR_B));
         assert_eq!(cache.len(), 2);
 
         // Clearing removes every entry, on every interface.
         cache.clear();
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_1), Instant::ZERO).found());
-        assert!(!cache.lookup(&(IF_1, MOCK_IP_ADDR_2.into()), Instant::ZERO).found());
+        assert!(!cache.lookup(&key(MOCK_IP_ADDR_1)).found());
+        assert!(!cache.lookup(&(IF_1, MOCK_IP_ADDR_2.into())).found());
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }
@@ -746,15 +736,15 @@ mod test {
             cache.fill(key(Ipv6Addr::from(addr)), HADDR_C, Instant::from_millis(200));
         }
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_2), Instant::from_millis(1000)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_2), Instant::from_millis(1000)),
             Answer::Found(HADDR_B)
         );
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_4), Instant::from_millis(1000)).found());
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_4), Instant::from_millis(1000)).found());
 
         cache.fill(key(MOCK_IP_ADDR_4), HADDR_D, Instant::from_millis(300));
-        assert!(!cache.lookup(&key(MOCK_IP_ADDR_2), Instant::from_millis(1000)).found());
+        assert!(!lookup_at(&mut cache, &key(MOCK_IP_ADDR_2), Instant::from_millis(1000)).found());
         assert_eq!(
-            cache.lookup(&key(MOCK_IP_ADDR_4), Instant::from_millis(1000)),
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_4), Instant::from_millis(1000)),
             Answer::Found(HADDR_D)
         );
     }
@@ -764,8 +754,8 @@ mod test {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution(key(MOCK_IP_ADDR_1), t0);
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Pending);
+        cache.start_resolution(key(MOCK_IP_ADDR_1));
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Pending);
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
         assert_eq!(cache.poll_retransmit(IF_0, t0, &mut 0), None);
@@ -786,7 +776,7 @@ mod test {
             cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0),
             Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
         );
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::NotFound);
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         let t3 = t0 + RETRANS_TIMER * 3;
         assert_eq!(next_deadline(&mut cache, t3), Instant::MAX);
     }
@@ -796,16 +786,16 @@ mod test {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution(key(MOCK_IP_ADDR_1), t0);
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Pending);
+        cache.start_resolution(key(MOCK_IP_ADDR_1));
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Pending);
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, t0);
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Found(HADDR_A));
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Found(HADDR_A));
 
-        // The resolved entry has no retransmission timer anymore.
+        // The resolved entry has no retransmission timer anymore, only its expiry.
         let t1 = t0 + RETRANS_TIMER;
         assert_eq!(cache.poll_retransmit(IF_0, t1, &mut 0), None);
-        assert_eq!(next_deadline(&mut cache, t1), Instant::MAX);
+        assert_eq!(next_deadline(&mut cache, t1), t0 + NeighborCache::ENTRY_LIFETIME);
     }
 
     /// A poll makes an expired entry stale. It isn't used to send, however long
@@ -817,7 +807,7 @@ mod test {
         let entry = |cache: &NeighborCache| cache.get(IF_0, MOCK_IP_ADDR_1.into()).unwrap().state;
 
         let expired = Instant::ZERO + NeighborCache::ENTRY_LIFETIME;
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), expired), Answer::NotFound);
+        assert_eq!(lookup_at(&mut cache, &key(MOCK_IP_ADDR_1), expired), Answer::NotFound);
         next_deadline(&mut cache, expired);
         assert_eq!(entry(&cache), NeighborState::Stale { hardware_addr: HADDR_A });
 
@@ -826,16 +816,16 @@ mod test {
         for _ in 0..100 {
             now += Duration::from_secs(24 * 60 * 60);
             next_deadline(&mut cache, now);
-            assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::NotFound);
+            assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         }
         assert_eq!(entry(&cache), NeighborState::Stale { hardware_addr: HADDR_A });
 
         // Traffic from another hardware address leaves it stale, traffic from
         // the same one makes it reachable.
         cache.reset_expiry_if_existing(key(MOCK_IP_ADDR_1), HADDR_B, now);
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::NotFound);
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         cache.reset_expiry_if_existing(key(MOCK_IP_ADDR_1), HADDR_A, now);
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), now), Answer::Found(HADDR_A));
+        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Found(HADDR_A));
         assert_eq!(
             entry(&cache),
             NeighborState::Reachable {
@@ -863,15 +853,27 @@ mod test {
 
         cache.fill(key(MOCK_IP_ADDR_4), HADDR_D, later);
         assert!(cache.get(IF_0, MOCK_IP_ADDR_1.into()).is_none());
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_2), later), Answer::Found(HADDR_B));
-        assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_4), later), Answer::Found(HADDR_D));
+        assert_eq!(
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_2), later),
+            Answer::Found(HADDR_B)
+        );
+        assert_eq!(
+            lookup_at(&mut cache, &key(MOCK_IP_ADDR_4), later),
+            Answer::Found(HADDR_D)
+        );
     }
 
-    /// The deadline the cache counts in a poll at `now`.
+    /// What a poll at `now` does to the cache, and the deadline it counts.
     fn next_deadline(cache: &mut NeighborCache, now: Instant) -> Instant {
         let mut clock = Clock::new(now);
         cache.expire(&mut clock);
         clock.next()
+    }
+
+    /// Look up a neighbor after a poll at `at`.
+    fn lookup_at(cache: &mut NeighborCache, key: &Key, at: Instant) -> Answer {
+        cache.expire(&mut Clock::new(at));
+        cache.lookup(key)
     }
 
     #[test]
@@ -879,7 +881,8 @@ mod test {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), t0);
+        cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()));
+        next_deadline(&mut cache, t0);
         // Polling one interface's timers doesn't touch another's entries.
         assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
         assert_eq!(
@@ -892,15 +895,11 @@ mod test {
     fn test_pending_queue() {
         let mut queue = PendingQueue::new();
 
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
-        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap(), Instant::ZERO);
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap());
+        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap());
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap());
         // Same address, different interface: distinct key.
-        queue.push(
-            (IF_1, MOCK_IP_ADDR_1.into()),
-            PacketBuf::try_new().unwrap(),
-            Instant::ZERO,
-        );
+        queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::try_new().unwrap());
 
         let taken = take_matching(&mut queue, &key(MOCK_IP_ADDR_1));
         assert_eq!(taken.len(), 2);
@@ -914,10 +913,10 @@ mod test {
         let mut queue = PendingQueue::new();
 
         for _ in 0..PENDING_QUEUE_COUNT {
-            queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
+            queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap());
         }
         // This push drops the oldest packet to make room.
-        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap());
 
         assert_eq!(
             take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).len(),
@@ -926,18 +925,21 @@ mod test {
         assert_eq!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).len(), 1);
     }
 
+    /// A parked packet stays while its resolution is in progress or resolved, and
+    /// goes once its entry is gone.
     #[test]
-    fn test_pending_queue_expire() {
+    fn test_pending_queue_orphans() {
         let mut queue = PendingQueue::new();
+        let mut cache = NeighborCache::new();
+        cache.start_resolution(key(MOCK_IP_ADDR_1));
 
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
-        let mut clock = Clock::new(Instant::ZERO);
-        queue.purge_expired(&mut clock);
-        assert_eq!(clock.next(), Instant::ZERO + PENDING_QUEUE_LIFETIME);
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap());
+        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap());
+        queue.purge_orphans(&cache);
+        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).is_empty());
 
-        let mut clock = Clock::new(Instant::ZERO + PENDING_QUEUE_LIFETIME);
-        queue.purge_expired(&mut clock);
-        assert_eq!(clock.next(), Instant::MAX);
+        cache.remove(IF_0, MOCK_IP_ADDR_1.into());
+        queue.purge_orphans(&cache);
         assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
     }
 
@@ -945,16 +947,8 @@ mod test {
     fn test_pending_queue_purge_iface() {
         let mut queue = PendingQueue::new();
 
-        queue.push(
-            (IF_0, MOCK_IP_ADDR_1.into()),
-            PacketBuf::try_new().unwrap(),
-            Instant::ZERO,
-        );
-        queue.push(
-            (IF_1, MOCK_IP_ADDR_1.into()),
-            PacketBuf::try_new().unwrap(),
-            Instant::ZERO,
-        );
+        queue.push((IF_0, MOCK_IP_ADDR_1.into()), PacketBuf::try_new().unwrap());
+        queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::try_new().unwrap());
 
         queue.purge_iface(IF_0);
         assert!(take_matching(&mut queue, &(IF_0, MOCK_IP_ADDR_1.into())).is_empty());

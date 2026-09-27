@@ -404,14 +404,6 @@ impl Timer {
         }
     }
 
-    fn set_keep_alive(&mut self) {
-        if let Timer::Idle { keep_alive_at } = self
-            && keep_alive_at.is_none()
-        {
-            *keep_alive_at = Some(Instant::from_millis(0))
-        }
-    }
-
     fn rewind_keep_alive(&mut self, timestamp: Instant, interval: Option<Duration>) {
         if let Timer::Idle { keep_alive_at } = self {
             *keep_alive_at = interval.map(|interval| timestamp + interval)
@@ -463,6 +455,16 @@ enum AckDelayTimer {
     Idle,
     Waiting(Instant),
     Immediate,
+}
+
+/// The challenge ACK rate limit.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ChallengeAckLimit {
+    /// A challenge ACK may go out.
+    None,
+    /// No more challenge ACKs until this instant.
+    Until(Instant),
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -557,8 +559,8 @@ pub(crate) struct TcpSocketState<'d> {
     /// ACK or window updates (ie, no data) won't be sent until expiry.
     ack_delay_timer: AckDelayTimer,
 
-    /// Used for rate-limiting: No more challenge ACKs will be sent until this instant.
-    challenge_ack_timer: Instant,
+    /// Rate-limits challenge ACKs.
+    challenge_ack_limit: ChallengeAckLimit,
 
     /// Nagle's Algorithm enabled.
     nagle: bool,
@@ -653,7 +655,7 @@ impl<'d> TcpSocketState<'d> {
             pending_fast_retransmit: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
-            challenge_ack_timer: Instant::from_secs(0),
+            challenge_ack_limit: ChallengeAckLimit::None,
             nagle: true,
             #[cfg(feature = "tcp-sack")]
             local_sack_history: [None, None, None],
@@ -755,7 +757,7 @@ impl<'d> TcpSocketState<'d> {
             self.last_remote_tsval = 0;
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
-        self.challenge_ack_timer = Instant::from_secs(0);
+        self.challenge_ack_limit = ChallengeAckLimit::None;
         self.congestion_controller = congestion::Congestion::new();
         #[cfg(feature = "tcp-sack")]
         {
@@ -898,12 +900,14 @@ impl<'d> TcpSocketState<'d> {
     }
 
     fn challenge_ack_reply(&mut self, now: Instant, repr: &TcpRepr) -> Option<TcpRepr<'static>> {
-        if now < self.challenge_ack_timer {
+        if let ChallengeAckLimit::Until(until) = self.challenge_ack_limit
+            && now < until
+        {
             return None;
         }
 
         // Rate-limit to 1 per second max.
-        self.challenge_ack_timer = now + Duration::from_secs(1);
+        self.challenge_ack_limit = ChallengeAckLimit::Until(now + Duration::from_secs(1));
 
         Some(self.ack_reply(now, repr))
     }
@@ -1811,8 +1815,10 @@ impl<'d> TcpSocketState<'d> {
         {
             self.ack_delay_timer = AckDelayTimer::Immediate;
         }
-        if self.challenge_ack_timer < now {
-            self.challenge_ack_timer = now;
+        if let ChallengeAckLimit::Until(until) = self.challenge_ack_limit
+            && until <= now
+        {
+            self.challenge_ack_limit = ChallengeAckLimit::None;
         }
 
         if self.remote_last_ts.is_none() && self.timeout_armed() {
@@ -1826,6 +1832,24 @@ impl<'d> TcpSocketState<'d> {
         }
 
         self.congestion_controller.pre_transmit(now);
+
+        // Data queued into a zero window since the last dispatch: the first probe
+        // goes out one RTO from now (RFC 9293 3.8.6.1).
+        if self.remote_win_len == 0
+            && !self.tx_buffer.is_empty()
+            && self.timer.is_idle()
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::Closing | State::CloseWait | State::LastAck
+            )
+        {
+            let delay = self.rtte.retransmission_timeout();
+            trace!("starting zero-window-probe timer for t+{}", delay);
+            self.timer = Timer::ZeroWindowProbe {
+                expires_at: clock.after(delay),
+                delay,
+            };
+        }
 
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(clock) {
@@ -2078,9 +2102,25 @@ impl<'d> TcpSocketState<'d> {
             // carries a fake sequence number, so the rest of the state is left intact.
             // The remote finds it unacceptable and ignores its ACK (RFC 9293
             // 3.10.7.4), so it doesn't count as having sent one.
-            Timer::Idle {
-                keep_alive_at: Some(keep_alive_at),
-            } if clock.expired(keep_alive_at) => {
+            // No keep-alive armed while keep-alive is on: it was just turned on on an
+            // idle connection, and the first one goes out now.
+            Timer::Idle { keep_alive_at }
+                if match keep_alive_at {
+                    Some(keep_alive_at) => clock.expired(keep_alive_at),
+                    None => {
+                        self.keep_alive.is_some()
+                            && matches!(
+                                self.state,
+                                State::Established
+                                    | State::FinWait1
+                                    | State::FinWait2
+                                    | State::Closing
+                                    | State::CloseWait
+                                    | State::LastAck
+                            )
+                    }
+                } =>
+            {
                 trace!("sending a keep-alive");
                 send(TcpRepr {
                     seq_number: self.remote_last_seq - 1,
@@ -2422,11 +2462,8 @@ impl<'d> TcpSocket<'_, 'd> {
             self.inner_mut().remote_last_ts = None;
         }
         self.inner_mut().keep_alive = interval;
-        if self.inner_mut().keep_alive.is_some() {
-            // If the connection is idle and we've just set the option, it would not take effect
-            // until the next packet, unless we wind up the timer explicitly.
-            self.inner_mut().timer.set_keep_alive();
-        }
+        // An idle connection with no keep-alive timer armed sends one at the next
+        // dispatch, which arms the timer.
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -2785,7 +2822,6 @@ impl<'d> TcpSocket<'_, 'd> {
             return Err(SendError::InvalidState);
         }
 
-        let now = self.tx.inner.now;
         let s = self.inner_mut();
         let old_length = s.tx_buffer.len();
         let was_armed = s.timeout_armed();
@@ -2798,13 +2834,8 @@ impl<'d> TcpSocket<'_, 'd> {
                 s.remote_last_ts = None
             }
 
-            // if remote win is zero and we go from having no data to some data pending to
-            // send, start the zero window probe timer.
-            if s.remote_win_len == 0 && s.timer.is_idle() {
-                let delay = s.rtte.retransmission_timeout();
-                trace!("starting zero-window-probe timer for t+{}", delay);
-                s.timer.set_for_zero_window_probe(now, delay);
-            }
+            // Data queued into a zero window starts the zero-window probe timer at
+            // the next dispatch.
 
             trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
         }
@@ -3088,8 +3119,6 @@ mod test {
 
     #[track_caller]
     fn send(socket: &mut TestSocket, timestamp: Instant, repr: &TcpRepr) -> Option<TcpRepr<'static>> {
-        socket.stack.inner.now = timestamp;
-
         let src_addr = IpAddr::from(REMOTE_ADDR);
         let dst_addr = IpAddr::from(LOCAL_ADDR);
         trace!("send: {}", repr);
@@ -3109,8 +3138,6 @@ mod test {
     /// each of them, and gets its index.
     #[track_caller]
     fn recv(socket: &mut TestSocket, timestamp: Instant, count: usize, mut f: impl FnMut(usize, TcpRepr)) {
-        socket.stack.inner.now = timestamp;
-
         let mut clock = Clock::new(timestamp);
         let mut sent = 0;
         let result: Result<(), ()> = socket.sockets.get_mut(0).dispatch(
@@ -3140,8 +3167,6 @@ mod test {
     /// socket must fill up. Returns the sequence number and payload of each packet.
     #[track_caller]
     fn recv_until_full(socket: &mut TestSocket, timestamp: Instant, room: usize) -> Vec<(TcpSeqNumber, Vec<u8>)> {
-        socket.stack.inner.now = timestamp;
-
         let mut sent = Vec::new();
         let result: Result<(), ()> = socket.sockets.get_mut(0).dispatch(
             &mut socket.stack.tx_context(),
@@ -9073,7 +9098,8 @@ mod test {
         assert!(!s.timer.is_zero_window_probe());
 
         s.view().send_slice(b"abcdef123456!@#$%^").unwrap();
-
+        // The next dispatch starts the timer.
+        recv_nothing!(s, time 0);
         assert!(s.timer.is_zero_window_probe());
     }
 

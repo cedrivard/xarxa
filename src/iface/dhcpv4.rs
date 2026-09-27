@@ -17,7 +17,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
-use super::{AddrOrigin, IfaceAddr, IfaceState};
+use super::{AddrOrigin, IfaceAddr, IfaceState, Preferred};
 use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 #[cfg(feature = "dhcpv4-options")]
 use crate::config::DHCP_OPTIONS_BUF_SIZE;
@@ -234,6 +234,8 @@ impl RenewState {
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum ClientState {
+    /// Starting over: the first DISCOVER goes out at the next poll (RFC 2131's INIT).
+    Init,
     /// Discovering the DHCP server
     Discovering(DiscoverState),
     /// Requesting an address
@@ -291,11 +293,10 @@ pub(crate) struct Client {
 }
 
 impl Client {
+    /// A client that sends its first DISCOVER at the next poll.
     pub(crate) fn new(config: DhcpConfig) -> Self {
         Client {
-            state: ClientState::Discovering(DiscoverState {
-                retry_at: Instant::from_millis(0),
-            }),
+            state: ClientState::Init,
             transaction_id: 1,
             config,
         }
@@ -557,7 +558,13 @@ impl Client {
 impl IfaceState<'_> {
     /// Process a DHCP packet received on this interface from `src_ip`. `payload` is
     /// the UDP payload, the ports have already been checked by the caller.
-    pub(crate) fn dhcpv4_process(&mut self, inner: &mut StackInner, src_ip: Ipv4Addr, payload: &mut [u8]) {
+    pub(crate) fn dhcpv4_process(
+        &mut self,
+        inner: &mut StackInner,
+        src_ip: Ipv4Addr,
+        payload: &mut [u8],
+        now: Instant,
+    ) {
         let ethernet_addr = self.hardware_addr;
         let Some(client) = &mut self.dhcpv4 else { return };
         let ethernet_addr = ethernet_addr.ethernet_or_panic();
@@ -603,7 +610,7 @@ impl IfaceState<'_> {
 
         debug!("DHCP recv {:?} from {}", message_type, src_ip);
 
-        let now = inner.now;
+        let now = now;
         let max_lease_duration = client.config.max_lease_duration;
         let ignore_naks = client.config.ignore_naks;
         match (&mut client.state, message_type) {
@@ -685,14 +692,18 @@ impl IfaceState<'_> {
             let ethernet_addr = ethernet_addr.ethernet_or_panic();
 
             match &mut client.state {
-                ClientState::Discovering(state) => {
-                    if !clock.expired(state.retry_at) {
+                ClientState::Init | ClientState::Discovering(_) => {
+                    if let ClientState::Discovering(state) = &client.state
+                        && !clock.expired(state.retry_at)
+                    {
                         return;
                     }
 
                     debug!("DHCP send DISCOVER to {}", Ipv4Addr::BROADCAST);
                     client.transaction_id = Client::random_transaction_id(inner);
-                    state.retry_at = clock.after(DISCOVER_TIMEOUT);
+                    client.state = ClientState::Discovering(DiscoverState {
+                        retry_at: clock.after(DISCOVER_TIMEOUT),
+                    });
                     let buf = Client::build(
                         &client.config,
                         #[cfg(feature = "hostname")]
@@ -815,12 +826,7 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_reset(&mut self, inner: &mut StackInner) {
         let Some(client) = &mut self.dhcpv4 else { return };
         trace!("DHCP reset");
-        let old = core::mem::replace(
-            &mut client.state,
-            ClientState::Discovering(DiscoverState {
-                retry_at: Instant::from_millis(0),
-            }),
-        );
+        let old = core::mem::replace(&mut client.state, ClientState::Init);
         if let ClientState::Renewing(state) = old {
             self.dhcpv4_apply(inner, None, Some(&state.lease));
         }
@@ -839,7 +845,7 @@ impl IfaceState<'_> {
                 let addr = IfaceAddr {
                     cidr,
                     origin: AddrOrigin::Dhcpv4,
-                    preferred_until: None,
+                    preferred: Preferred::Always,
                 };
                 if self.ip_addrs.push(addr).is_err() {
                     warn!("dhcp: address table full, {} not assigned", cidr);
@@ -1139,7 +1145,7 @@ mod test {
             &[IfaceAddr {
                 cidr: IpCidr::new(OFFERED_IP.into(), 24),
                 origin: AddrOrigin::Dhcpv4,
-                preferred_until: None
+                preferred: Preferred::Always
             }]
         );
         let route = stack.routes().default_ipv4_route().unwrap();
@@ -1735,7 +1741,7 @@ mod test {
             &[IfaceAddr {
                 cidr: IpCidr::new(OFFERED_IP.into(), 24),
                 origin: AddrOrigin::Dhcpv4,
-                preferred_until: None
+                preferred: Preferred::Always
             }]
         );
         let route = stack.routes().default_ipv4_route().unwrap();
@@ -1830,7 +1836,7 @@ mod test {
             &[IfaceAddr {
                 cidr: IpCidr::new(OFFERED_IP.into(), 24),
                 origin: AddrOrigin::Dhcpv4,
-                preferred_until: None
+                preferred: Preferred::Always
             }]
         );
         assert!(stack.routes().default_ipv4_route().is_some());

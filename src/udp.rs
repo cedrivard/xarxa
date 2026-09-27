@@ -505,7 +505,7 @@ impl UdpSocket<'_, '_> {
     /// matches multiple sockets, the one with the most specific binding wins.
     /// Packets are not duplicated, only the winning socket will receive it.
     ///
-    /// Multicast groups are not joined automatically, you must call [`Iface::join_multicast_group`](crate::Iface::join_multicast_group) yourself.
+    /// Multicast groups are not joined automatically, you must call [`Iface::join_multicast_group`](crate::iface::Iface::join_multicast_group) yourself.
     ///
     /// # Errors
     /// - `InvalidState`: if the socket is already bound (see

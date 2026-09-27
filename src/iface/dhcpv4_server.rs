@@ -783,7 +783,13 @@ impl IfaceState<'_> {
     /// Process a DHCP packet received on this interface from `src_ip`, and send
     /// the reply, if it gets one. `payload` is the UDP payload; the ports have
     /// already been checked by the caller.
-    pub(crate) fn dhcpv4_server_process(&mut self, inner: &mut StackInner, src_ip: Ipv4Addr, payload: &mut [u8]) {
+    pub(crate) fn dhcpv4_server_process(
+        &mut self,
+        inner: &mut StackInner,
+        src_ip: Ipv4Addr,
+        payload: &mut [u8],
+        now: Instant,
+    ) {
         let checksum_caps = self.checksum_caps();
         let server_cidr = self.dhcpv4_server_cidr();
         let Some(server) = &mut self.dhcpv4_server else { return };
@@ -818,7 +824,7 @@ impl IfaceState<'_> {
         }
 
         debug!("DHCP server: recv {:?} from {}", message_type, src_ip);
-        let reply = server.handle(inner.now, server_cidr, &checksum_caps, message_type, &packet);
+        let reply = server.handle(now, server_cidr, &checksum_caps, message_type, &packet);
 
         if let Some((mut buf, dst_addr, dst_hw)) = reply {
             push_ipv4_header(

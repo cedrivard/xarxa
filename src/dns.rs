@@ -288,6 +288,7 @@ impl DnsClient {
                 txid,
                 delay: RETRANSMIT_DELAY,
                 timeout_at: None,
+                // Set by the first poll, along with `timeout_at`.
                 retransmit_at: Instant::ZERO,
                 server_idx: 0,
                 mdns,
@@ -348,16 +349,16 @@ impl DnsClient {
 
     /// Advance the client: process received responses and send due queries.
     ///
-    /// Uses the time of the last `Stack::poll`.
+    /// `now` is the current time.
     ///
     /// Returns the next time `poll` should be called to retransmit a query or try
     /// the next server, or [`Instant::MAX`] if no query is pending. It is always
-    /// later than the time of the last `Stack::poll`. Call it after every
-    /// [`Stack::poll`], and again when that deadline arrives.
+    /// later than `now`. Call it after every [`Stack::poll`], and again when that
+    /// deadline arrives.
     #[must_use]
-    pub fn poll(&mut self, stack: &mut Stack) -> Instant {
+    pub fn poll(&mut self, stack: &mut Stack, now: Instant) -> Instant {
         self.process(stack);
-        self.dispatch(stack)
+        self.dispatch(stack, now)
     }
 
     fn accepts(&self, remote: SocketAddr) -> bool {
@@ -522,8 +523,8 @@ impl DnsClient {
         }
     }
 
-    fn dispatch(&mut self, stack: &mut Stack) -> Instant {
-        let now = stack.inner.now;
+    fn dispatch(&mut self, stack: &mut Stack, now: Instant) -> Instant {
+        let now = now;
         let mut clock = Clock::new(now);
 
         for (_, q) in self.queries.iter_mut() {
@@ -545,8 +546,10 @@ impl DnsClient {
                 let mut timeout = if let Some(timeout) = pq.timeout_at {
                     timeout
                 } else {
+                    // Not sent yet: the first query goes out now.
                     let v = now + RETRANSMIT_TIMEOUT;
                     pq.timeout_at = Some(v);
+                    pq.retransmit_at = now;
                     v
                 };
 
@@ -555,7 +558,7 @@ impl DnsClient {
                     // DNS timeout
                     timeout = now + RETRANSMIT_TIMEOUT;
                     pq.timeout_at = Some(timeout);
-                    pq.retransmit_at = Instant::ZERO;
+                    pq.retransmit_at = now;
                     pq.delay = RETRANSMIT_DELAY;
 
                     // Try next server. We check below whether we've tried all servers.

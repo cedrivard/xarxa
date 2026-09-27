@@ -274,7 +274,7 @@ impl Stack<'_> {
     /// fragment's IP header in front, patched to describe the whole datagram.
     /// `None` while the packet is incomplete, or if the fragment was dropped.
     #[cfg(feature = "ipv4-reassembly")]
-    pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf) -> Option<PacketBuf> {
+    pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf, now: Instant) -> Option<PacketBuf> {
         let ipv4_packet = Ipv4Packet::new_unchecked(&mut buf);
 
         let key = FragKey::Ipv4(Ipv4FragKey::of(&ipv4_packet));
@@ -282,7 +282,7 @@ impl Stack<'_> {
         let f = match self
             .fragments
             .assembler
-            .get(&key, self.inner.now + self.fragments.reassembly_timeout)
+            .get(&key, now + self.fragments.reassembly_timeout)
         {
             Ok(f) => f,
             Err(_) => {

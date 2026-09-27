@@ -13,7 +13,7 @@ use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
-use super::{AddrOrigin, IfaceAddr, IfaceState};
+use super::{AddrOrigin, IfaceAddr, IfaceState, Preferred};
 use crate::driver::{LinkState, PacketBuf};
 use crate::route::{Route as IfaceRoute, RouteOrigin};
 use crate::stack::StackInner;
@@ -57,8 +57,12 @@ pub struct SlaacState {
 /// Router solicitation state machine
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
+    /// The next router solicitation is due at the next poll.
     Start,
-    Discovering,
+    /// Soliciting routers. The next solicitation is due at `retry_rs_at`.
+    Discovering {
+        retry_rs_at: Instant,
+    },
     Maintaining,
     None,
 }
@@ -158,8 +162,6 @@ pub(crate) struct Slaac {
     phase: Phase,
     /// Signal for address and route updates.
     sync_required: bool,
-    /// Time to next router solicitation.
-    retry_rs_at: Instant,
     /// Number of solicitations emitted.
     num_solicitations: u8,
     /// What the application can see.
@@ -175,7 +177,6 @@ impl Slaac {
             routes: Vec::new(),
             phase: Phase::Start,
             sync_required: false,
-            retry_rs_at: Instant::from_millis(0),
             num_solicitations: MAX_RTR_SOLICITATIONS,
             state: SlaacState::default(),
             config,
@@ -288,7 +289,7 @@ impl Slaac {
         self.state.other_config = flags.contains(NdiscRouterFlags::OTHER);
 
         // Advertisement might be unsolicited
-        if self.phase == Phase::Discovering {
+        if matches!(self.phase, Phase::Discovering { .. }) {
             self.phase = Phase::Maintaining;
         }
     }
@@ -329,13 +330,17 @@ impl Slaac {
 
     /// Get whether a router solicitation must be emitted.
     fn rs_required(&self, clock: &mut Clock) -> bool {
-        clock.expired(self.rs_at())
+        match self.phase {
+            Phase::Start => self.num_solicitations > 0,
+            Phase::Discovering { retry_rs_at } if self.num_solicitations > 0 => clock.expired(retry_rs_at),
+            _ => false,
+        }
     }
 
     /// When the next router solicitation is due. `Instant::MAX` if none is.
     fn rs_at(&self) -> Instant {
         match self.phase {
-            Phase::Start | Phase::Discovering if self.num_solicitations > 0 => self.retry_rs_at,
+            Phase::Discovering { retry_rs_at } if self.num_solicitations > 0 => retry_rs_at,
             _ => Instant::MAX,
         }
     }
@@ -344,7 +349,6 @@ impl Slaac {
     pub(crate) fn restart(&mut self) {
         self.phase = Phase::Start;
         self.num_solicitations = MAX_RTR_SOLICITATIONS;
-        self.retry_rs_at = Instant::from_millis(0);
     }
 
     /// Update router solicitation tracking state
@@ -352,16 +356,20 @@ impl Slaac {
     /// Must be called after sending a router solicitation on the interface.
     fn rs_sent(&mut self, now: Instant) {
         match self.phase {
-            Phase::Start | Phase::Discovering if self.retry_rs_at <= now => {
-                if self.num_solicitations == 0 {
-                    self.phase = Phase::None;
-                } else {
-                    self.num_solicitations -= 1;
-                    self.phase = Phase::Discovering;
-                    self.retry_rs_at = now + RTR_SOLICITATION_INTERVAL;
-                }
-            }
+            Phase::Start => self.solicited(now),
+            Phase::Discovering { retry_rs_at } if retry_rs_at <= now => self.solicited(now),
             _ => (),
+        }
+    }
+
+    fn solicited(&mut self, now: Instant) {
+        if self.num_solicitations == 0 {
+            self.phase = Phase::None;
+        } else {
+            self.num_solicitations -= 1;
+            self.phase = Phase::Discovering {
+                retry_rs_at: now + RTR_SOLICITATION_INTERVAL,
+            };
         }
     }
 }
@@ -385,6 +393,7 @@ impl IfaceState<'_> {
         inner: &mut StackInner,
         src_addr: Ipv6Addr,
         icmp_packet: &mut Icmpv6Packet<'_>,
+        now: Instant,
     ) {
         let Some(slaac) = &mut self.slaac else { return };
 
@@ -426,19 +435,19 @@ impl IfaceState<'_> {
             }
             None
         });
-        slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes, inner.now);
+        slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes, now);
 
         if let Some(lladdr) = lladdr
             && let Ok(lladdr) = lladdr.parse(self.medium())
             && lladdr.is_unicast()
         {
-            inner.fill_neighbor(self, crate::wire::IpAddr::V6(src_addr), lladdr);
+            inner.fill_neighbor(self, crate::wire::IpAddr::V6(src_addr), lladdr, now);
         }
     }
 
     /// Synchronize the slaac address and router state with the interface state.
-    fn sync_slaac_state(&mut self, inner: &mut StackInner) {
-        let timestamp = inner.now;
+    fn sync_slaac_state(&mut self, inner: &mut StackInner, now: Instant) {
+        let timestamp = now;
         let hardware_addr = self.hardware_addr;
         let Some(slaac) = &self.slaac else { return };
 
@@ -450,6 +459,12 @@ impl IfaceState<'_> {
             if !prefixinfo.is_valid(timestamp) {
                 continue;
             }
+            // A preferred lifetime that has run out is not kept as a time.
+            let preferred = if prefixinfo.preferred_until > timestamp {
+                Preferred::Until(prefixinfo.preferred_until)
+            } else {
+                Preferred::Never
+            };
             let Some(address) = from_link_prefix(prefix, hardware_addr) else {
                 continue;
             };
@@ -459,7 +474,7 @@ impl IfaceState<'_> {
                 // formed from it has to follow, or nothing downstream can tell that it
                 // is on its way out.
                 Some(existing) if existing.origin == AddrOrigin::Slaac => {
-                    existing.preferred_until = Some(prefixinfo.preferred_until);
+                    existing.preferred = preferred;
                 }
                 // Somebody else's, and it only happens to be the address this prefix
                 // forms. Not ours to deprecate: the expiry below leaves it alone too.
@@ -468,7 +483,7 @@ impl IfaceState<'_> {
                     let new_addr = IfaceAddr {
                         cidr: IpCidr::V6(address),
                         origin: AddrOrigin::Slaac,
-                        preferred_until: Some(prefixinfo.preferred_until),
+                        preferred,
                     };
                     if self.ip_addrs.push(new_addr).is_err() {
                         warn!("slaac: address table full, {} not assigned", address);
@@ -539,9 +554,10 @@ impl IfaceState<'_> {
     /// Run SLAAC: solicit routers when due, and apply what the advertisements
     /// taught to the interface's addresses and routes.
     pub(crate) fn slaac_poll(&mut self, inner: &mut StackInner, clock: &mut Clock) {
+        let now = clock.now();
         self.ndisc_rs_egress(inner, clock);
         if self.slaac.as_ref().is_some_and(|s| s.sync_required(clock)) {
-            self.sync_slaac_state(inner);
+            self.sync_slaac_state(inner, now);
         }
     }
 
@@ -751,7 +767,7 @@ mod test {
 
         let now = Instant::from_secs(300);
         slaac.rs_sent(now);
-        assert_eq!(slaac.phase, Phase::Discovering);
+        assert!(matches!(slaac.phase, Phase::Discovering { .. }));
 
         // Solicited advertisement
         advertise(&mut slaac, VALID, Some(PREFIX), now);

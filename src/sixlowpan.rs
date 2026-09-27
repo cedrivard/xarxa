@@ -16,6 +16,7 @@ use crate::rand::Rand;
 use crate::stack::Blocked;
 use crate::stack::{Stack, StackInner};
 use crate::storage::Vec;
+use crate::time::Instant;
 use crate::wire::ip::checksum;
 use crate::wire::*;
 
@@ -135,7 +136,7 @@ impl Iface<'_, '_> {
 
 // Ingress.
 impl Stack<'_> {
-    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf) {
+    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
         let (ieee802154_repr, header_len) = check!(Ieee802154Repr::parse(&buf));
 
         if ieee802154_repr.frame_type != Ieee802154FrameType::Data {
@@ -164,10 +165,16 @@ impl Stack<'_> {
         }
 
         buf.pull_front(header_len);
-        self.process_sixlowpan(iface, &ieee802154_repr, buf)
+        self.process_sixlowpan(iface, &ieee802154_repr, buf, now)
     }
 
-    fn process_sixlowpan(&mut self, iface: IfaceHandle, ieee802154_repr: &Ieee802154Repr, mut buf: PacketBuf) {
+    fn process_sixlowpan(
+        &mut self,
+        iface: IfaceHandle,
+        ieee802154_repr: &Ieee802154Repr,
+        mut buf: PacketBuf,
+        now: Instant,
+    ) {
         let buf = match check!(SixlowpanPacket::dispatch(&buf)) {
             #[cfg(not(feature = "sixlowpan-reassembly"))]
             SixlowpanPacket::FragmentHeader => {
@@ -179,7 +186,7 @@ impl Stack<'_> {
             }
             #[cfg(feature = "sixlowpan-reassembly")]
             SixlowpanPacket::FragmentHeader => {
-                let Some(buf) = self.process_sixlowpan_fragment(iface, ieee802154_repr, buf) else {
+                let Some(buf) = self.process_sixlowpan_fragment(iface, ieee802154_repr, buf, now) else {
                     return;
                 };
                 buf
@@ -208,6 +215,7 @@ impl Stack<'_> {
                 ieee802154_repr.src_addr.unwrap_or(Ieee802154Address::Absent),
             )),
             buf,
+            now,
         )
     }
 }
@@ -646,6 +654,7 @@ impl Stack<'_> {
         iface: IfaceHandle,
         ieee802154_repr: &Ieee802154Repr,
         mut buf: PacketBuf,
+        now: Instant,
     ) -> Option<PacketBuf> {
         use crate::reassembly::FragKey;
 
@@ -682,7 +691,7 @@ impl Stack<'_> {
         let frag_slot = match self
             .fragments
             .assembler
-            .get(&key, self.inner.now + self.fragments.reassembly_timeout)
+            .get(&key, now + self.fragments.reassembly_timeout)
         {
             Ok(frag) => frag,
             Err(_) => {
@@ -1929,7 +1938,11 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         assert_eq!(stack.poll(Instant::ZERO), Instant::from_secs(1));
         // The fragments are forgotten by then: the last one alone completes nothing.
         stack.poll(Instant::from_secs(2));
-        assert_eq!(stack.poll(Instant::from_secs(2)), Instant::MAX);
+        // Only the sender's neighbor entry, learned at 0, is left to expire.
+        assert_eq!(
+            stack.poll(Instant::from_secs(2)),
+            Instant::ZERO + crate::neighbor::NeighborCache::ENTRY_LIFETIME
+        );
         inject(&mut stack, &rx, frames[3].clone());
         assert_eq!(stack.udp_socket(udp).recv().err(), Some(RecvError::Exhausted));
     }

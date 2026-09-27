@@ -35,7 +35,7 @@ use crate::stack::Blocked;
 use crate::stack::TxTimestampQueue;
 use crate::stack::{Stack, StackInner};
 use crate::storage::{MaybeBox, Slab, Vec};
-use crate::time::Instant;
+use crate::time::{Clock, Instant};
 use crate::wire::*;
 
 define_handle! {
@@ -203,13 +203,28 @@ pub struct IfaceAddr {
     pub cidr: IpCidr,
     /// Where the address came from.
     pub origin: AddrOrigin,
-    /// When the address stops being preferred and becomes deprecated
-    /// (RFC 4862 section 5.5.4). `None` means "forever".
+    /// Whether the address is preferred or deprecated (RFC 4862 section 5.5.4).
     ///
-    /// Only SLAAC sets this: a router advertises a preferred lifetime alongside
-    /// the valid one, and shortens it to zero to signal that a prefix is on its
-    /// way out while addresses formed from it still work.
-    pub preferred_until: Option<Instant>,
+    /// Only SLAAC sets anything but [`Preferred::Always`]: a router advertises a
+    /// preferred lifetime alongside the valid one, and shortens it to zero to
+    /// signal that a prefix is on its way out while addresses formed from it
+    /// still work.
+    pub preferred: Preferred,
+}
+
+/// Whether an address is preferred, or deprecated.
+///
+/// A deprecated address keeps working for connections that already use it,
+/// but is avoided when a source address is chosen for a new one.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preferred {
+    /// Preferred for as long as it is assigned.
+    Always,
+    /// Preferred until this instant, deprecated after it.
+    Until(Instant),
+    /// Deprecated.
+    Never,
 }
 
 impl IfaceAddr {
@@ -218,16 +233,32 @@ impl IfaceAddr {
         Self {
             cidr,
             origin: AddrOrigin::Manual,
-            preferred_until: None,
+            preferred: Preferred::Always,
         }
     }
 
-    /// Whether the address is still preferred, i.e. not deprecated.
+    /// Whether the address is preferred, i.e. not deprecated.
     ///
-    /// A deprecated address keeps working for connections that already use it,
-    /// but is avoided when a source address is chosen for a new one.
-    pub fn is_preferred(&self, now: Instant) -> bool {
-        self.preferred_until.is_none_or(|until| until > now)
+    /// [`Stack::poll`](crate::Stack::poll) turns [`Preferred::Until`] into
+    /// [`Preferred::Never`] once the instant has passed.
+    pub fn is_preferred(&self) -> bool {
+        !matches!(self.preferred, Preferred::Never)
+    }
+}
+
+/// Deprecate the addresses whose preferred lifetime ran out, and count the others
+/// toward the next deadline.
+///
+/// The poll calls this at its start, before anything in it picks a source
+/// address, and at its end, after everything that can refresh a lifetime. Only
+/// the end call's deadline counts.
+pub(crate) fn expire_preferred(addrs: &mut [IfaceAddr], clock: &mut Clock) {
+    for addr in addrs {
+        if let Preferred::Until(until) = addr.preferred
+            && clock.expired(until)
+        {
+            addr.preferred = Preferred::Never;
+        }
     }
 }
 
@@ -242,7 +273,7 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
     Some(IfaceAddr {
         cidr: IpCidr::new(Ipv6Addr::from(bytes).into(), 64),
         origin: AddrOrigin::LinkLocal,
-        preferred_until: None,
+        preferred: Preferred::Always,
     })
 }
 
@@ -849,12 +880,12 @@ impl IfaceState<'_> {
 
     /// Get a source address for the given destination address.
     #[cfg(any(feature = "udp", feature = "tcp"))]
-    pub(crate) fn get_source_address(&self, dst_addr: &IpAddr, #[allow(unused)] now: Instant) -> Option<IpAddr> {
+    pub(crate) fn get_source_address(&self, dst_addr: &IpAddr) -> Option<IpAddr> {
         match dst_addr {
             #[cfg(feature = "ipv4")]
             IpAddr::V4(addr) => self.get_source_address_ipv4(addr).map(IpAddr::V4),
             #[cfg(feature = "ipv6")]
-            IpAddr::V6(addr) => Some(IpAddr::V6(self.get_source_address_ipv6(addr, now))),
+            IpAddr::V6(addr) => Some(IpAddr::V6(self.get_source_address_ipv6(addr))),
         }
     }
 
@@ -994,7 +1025,7 @@ impl IfaceState<'_> {
     /// # Panics
     /// This function panics if the destination address is unspecified.
     #[cfg(feature = "ipv6")]
-    pub(crate) fn get_source_address_ipv6(&self, dst_addr: &Ipv6Addr, now: Instant) -> Ipv6Addr {
+    pub(crate) fn get_source_address_ipv6(&self, dst_addr: &Ipv6Addr) -> Ipv6Addr {
         assert!(!dst_addr.is_unspecified());
 
         // See RFC 6724 Section 4: Candidate source address
@@ -1069,7 +1100,6 @@ impl IfaceState<'_> {
             (candidate, candidate_cidr): (&IfaceAddr, &Ipv6Cidr),
             (addr, cidr): (&IfaceAddr, &Ipv6Cidr),
             dst_addr: &Ipv6Addr,
-            now: Instant,
         ) -> bool {
             // Rule 1: prefer the address that is the same as the output destination address.
             if cidr.address() == *dst_addr {
@@ -1099,8 +1129,8 @@ impl IfaceState<'_> {
             // address wins even when a deprecated one matches more closely. It sits
             // below rules 1 and 2, so it cannot hand back an address of the wrong
             // scope, nor pass over the destination address itself.
-            if candidate.is_preferred(now) != addr.is_preferred(now) {
-                return addr.is_preferred(now);
+            if candidate.is_preferred() != addr.is_preferred() {
+                return addr.is_preferred();
             }
 
             // Rule 4: prefer home addresses (TODO)
@@ -1117,7 +1147,7 @@ impl IfaceState<'_> {
                 continue;
             }
 
-            if prefer((candidate, candidate_cidr), (addr, cidr), dst_addr, now) {
+            if prefer((candidate, candidate_cidr), (addr, cidr), dst_addr) {
                 (candidate, candidate_cidr) = (addr, cidr);
             }
         }
