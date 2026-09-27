@@ -173,7 +173,8 @@ fn exhaustion() {
         // A buffer is back by the retry. The device frees each fragment's buffer as
         // it takes it, so the one buffer carries both fragments.
         drop(again.pop());
-        assert_eq!(stack.poll(retry), Instant::MAX);
+        // Nothing left to do: the stack asks to be polled again in a day.
+        assert_eq!(stack.poll(retry), retry + Duration::from_secs(24 * 60 * 60));
         assert_eq!(tx.borrow().len(), 2);
     }
 

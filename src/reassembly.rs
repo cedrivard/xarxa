@@ -331,6 +331,7 @@ impl Stack<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::idle_deadline;
 
     #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
     struct Key {
@@ -431,7 +432,7 @@ mod tests {
         // Polling at the deadline removes it.
         let mut clock = Clock::new(Instant::from_secs(10));
         set.remove_expired(&mut clock);
-        assert_eq!(clock.next(), Instant::MAX);
+        assert_eq!(clock.next(), idle_deadline(clock.now()));
     }
 
     #[test]

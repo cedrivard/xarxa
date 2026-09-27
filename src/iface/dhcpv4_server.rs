@@ -476,7 +476,7 @@ impl Server {
         let requested_lease = packet
             .option(field::OPT_IP_LEASE_TIME)
             .and_then(parse_u32)
-            .map(|secs| Duration::from_secs(secs as u64));
+            .map(Duration::from_secs);
 
         let Some(addr) = self.pick_addr(id, requested, now, &server_cidr) else {
             debug!("DHCP server: no free address for {}", chaddr);
@@ -585,7 +585,7 @@ impl Server {
                     packet
                         .option(field::OPT_IP_LEASE_TIME)
                         .and_then(parse_u32)
-                        .map(|secs| Duration::from_secs(secs as u64)),
+                        .map(Duration::from_secs),
                 );
                 // Drop stale records of previous holders of the address.
                 self.leases.retain(|l| l.address != addr || l.matches_client(id));
@@ -694,10 +694,9 @@ impl Server {
                 data: &server_cidr.address().octets(),
             })?;
             if let Some(duration) = reply.lease_duration {
-                let secs = duration.as_secs().min(u32::MAX as u64) as u32;
                 options.emit(DhcpOption {
                     kind: field::OPT_IP_LEASE_TIME,
-                    data: &secs.to_be_bytes(),
+                    data: &duration.as_secs().to_be_bytes(),
                 })?;
             }
             if reply.message_type != DhcpMessageType::Nak {
@@ -871,10 +870,14 @@ mod test {
     const OTHER_SERVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
     const XID: u32 = 0xabcd1234;
     const IFACE: IfaceHandle = IfaceHandle::new(0);
-    const LEASE_SECS: u64 = 300;
+    const LEASE_SECS: u32 = 300;
 
-    fn at(secs: i64) -> Instant {
-        Instant::from_secs(secs)
+    /// When the tests' clock starts: five minutes before it wraps around, so the
+    /// leases of every test expire across the wraparound.
+    const T0: Instant = Instant::from_millis(0u32.wrapping_sub(300_000));
+
+    fn at(secs: u32) -> Instant {
+        T0 + Duration::from_secs(secs)
     }
 
     /// A pool of two addresses, ourselves as gateway, one DNS server.
@@ -1018,7 +1021,7 @@ mod test {
     }
 
     /// Feed one client message and run the stack.
-    fn send(stack: &mut Stack<'_>, rx: &Queue, msg: Msg, t: i64) {
+    fn send(stack: &mut Stack<'_>, rx: &Queue, msg: Msg, t: u32) {
         rx.borrow_mut().push_back(frame(&msg));
         stack.poll(at(t));
     }
@@ -1071,7 +1074,7 @@ mod test {
 
     /// Drive a client to a bound lease on `POOL_START`: DISCOVER at `t`, REQUEST
     /// at `t + 1`.
-    fn bind_first_client(stack: &mut Stack<'_>, rx: &Queue, t: i64) {
+    fn bind_first_client(stack: &mut Stack<'_>, rx: &Queue, t: u32) {
         send(stack, rx, Msg::new(DhcpMessageType::Discover, CLIENT_HW), t);
         send(
             stack,
@@ -1110,7 +1113,7 @@ mod test {
             );
             assert_eq!(
                 packet.option(field::OPT_IP_LEASE_TIME),
-                Some(&(LEASE_SECS as u32).to_be_bytes()[..])
+                Some(&LEASE_SECS.to_be_bytes()[..])
             );
             assert_eq!(packet.option(field::OPT_SUBNET_MASK), Some(&[255, 255, 255, 0][..]));
             assert_eq!(packet.option(field::OPT_ROUTER), Some(&SERVER_IP.octets()[..]));
@@ -1162,7 +1165,7 @@ mod test {
             assert_eq!(packet.your_ip(), POOL_START);
             assert_eq!(
                 packet.option(field::OPT_IP_LEASE_TIME),
-                Some(&(LEASE_SECS as u32).to_be_bytes()[..])
+                Some(&LEASE_SECS.to_be_bytes()[..])
             );
         }
         {
@@ -1441,7 +1444,7 @@ mod test {
             &mut stack,
             &rx,
             Msg::new(DhcpMessageType::Discover, CLIENT2_HW),
-            2 + DECLINE_TIMEOUT.as_secs() as i64 + 1,
+            2 + DECLINE_TIMEOUT.as_secs() + 1,
         );
         let mut sent = last_sent(&tx);
         assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
@@ -1479,15 +1482,16 @@ mod test {
             &mut stack,
             &rx,
             Msg::new(DhcpMessageType::Discover, CLIENT3_HW),
-            LEASE_SECS as i64 + 2,
+            LEASE_SECS + 2,
         );
         let mut sent = last_sent(&tx);
         assert_eq!(message_type(&mut sent), DhcpMessageType::Offer);
         assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
     }
 
-    /// A poll turns a lease that ran out into an `Expired` record. Weeks later its
-    /// address is still free for another client.
+    /// A poll turns a lease that ran out into an `Expired` record, which keeps no
+    /// time that could come back to life when the clock wraps around. Weeks later
+    /// its address is still free for another client.
     #[test]
     fn test_expired_lease_becomes_record() {
         let (mut stack, rx, tx) = test_stack();
@@ -1520,7 +1524,7 @@ mod test {
             &mut stack,
             &rx,
             Msg::new(DhcpMessageType::Discover, CLIENT_HW),
-            LEASE_SECS as i64 + 100,
+            LEASE_SECS + 100,
         );
         let mut sent = last_sent(&tx);
         assert_eq!(DhcpPacket::new_checked(&mut sent.dhcp).unwrap().your_ip(), POOL_START);
@@ -1696,7 +1700,7 @@ mod test {
         let packet = DhcpPacket::new_checked(&mut sent.dhcp).unwrap();
         assert_eq!(
             packet.option(field::OPT_IP_LEASE_TIME),
-            Some(&(LEASE_SECS as u32).to_be_bytes()[..])
+            Some(&LEASE_SECS.to_be_bytes()[..])
         );
     }
 

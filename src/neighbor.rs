@@ -560,6 +560,7 @@ impl PendingQueue {
 mod test {
     use super::*;
     use crate::iface::IfaceHandle;
+    use crate::time::{MAX_POLL_DELAY, idle_deadline};
     use crate::wire::Ipv6Addr;
     use crate::wire::ipv6::test::{MOCK_IP_ADDR_1, MOCK_IP_ADDR_2, MOCK_IP_ADDR_3, MOCK_IP_ADDR_4};
     #[allow(unused_imports)]
@@ -778,7 +779,7 @@ mod test {
         );
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         let t3 = t0 + RETRANS_TIMER * 3;
-        assert_eq!(next_deadline(&mut cache, t3), Instant::MAX);
+        assert_eq!(next_deadline(&mut cache, t3), idle_deadline(t3));
     }
 
     #[test]
@@ -811,10 +812,10 @@ mod test {
         next_deadline(&mut cache, expired);
         assert_eq!(entry(&cache), NeighborState::Stale { hardware_addr: HADDR_A });
 
-        // Polled once a day for 100 days.
+        // Polled once a day for 100 days, twice around the clock.
         let mut now = expired;
         for _ in 0..100 {
-            now += Duration::from_secs(24 * 60 * 60);
+            now += MAX_POLL_DELAY;
             next_deadline(&mut cache, now);
             assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         }

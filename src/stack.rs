@@ -1045,11 +1045,14 @@ impl<'d> Stack<'d> {
     ///
     /// Returns a "poll deadline" instant. It is the earliest expiring timer, and it is always
     /// later than `timestamp`. You should call `poll` at that instant to let it advance timers.
+    /// Also call it after a packet is received, a device has room to transmit again after it
+    /// had none, or an operation is done on the Stack, a socket or an interface.
+    ///
     /// Special cases:
     /// - If it's in the past by the time you check, `poll` should be called again immediately.
-    /// - If no timer is pending, [`Instant::MAX`] is returned. No need to call `poll` on a timer, only after
-    ///   a packet is received, a device has room to transmit again after it had none, or an
-    ///   operation is done on the Stack, a socket or an interface.
+    /// - If no timer is pending, or none is due within a day, the deadline is one day after
+    ///   `timestamp`. Call `poll` then anyway. [`Instant`]s wrap around, and polling at least
+    ///   this often is what keeps the ones the stack holds comparable with the current time.
     #[cfg_attr(
         feature = "async",
         doc = "",
@@ -3055,7 +3058,7 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::test_device::Link;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
-    use crate::time::Duration;
+    use crate::time::{Duration, idle_deadline};
     use crate::udp::RecvError as UdpRecvError;
     #[allow(unused_imports)]
     use std::vec::Vec;
@@ -3398,7 +3401,7 @@ pub(crate) mod test {
         assert_eq!(deadline, now + Duration::from_secs(7200));
         let deadline = stack.poll(now + Duration::from_secs(7201));
         assert!(!stack.iface(iface).has_ip_addr(our_addr.address()));
-        assert_eq!(deadline, Instant::MAX);
+        assert_eq!(deadline, idle_deadline(now + Duration::from_secs(7201)));
 
         // A router can withdraw with zero lifetimes.
         let now = now + Duration::from_secs(7300);
@@ -3685,7 +3688,7 @@ pub(crate) mod test {
     /// it just after the link comes back. Polling while down is what lets the stack observe
     /// the falling edge.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
-    fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: i64) {
+    fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: u32) {
         link.set(crate::driver::LinkState::Down);
         stack.poll(Instant::from_secs(at));
         tx.borrow_mut().clear();
@@ -3780,7 +3783,7 @@ pub(crate) mod test {
 
         link.set(crate::driver::LinkState::Down);
         stack.iface(iface).set_slaac(Some(SlaacConfig::default())).unwrap();
-        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(1)), idle_deadline(Instant::from_secs(1)));
         assert!(tx.borrow().is_empty());
 
         // Once the link is back, the solicitation goes out, and the next one is due
@@ -3807,7 +3810,7 @@ pub(crate) mod test {
         tx.borrow_mut().clear();
 
         stack.iface(iface).set_slaac(Some(SlaacConfig::default())).unwrap();
-        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(1)), idle_deadline(Instant::from_secs(1)));
         assert!(tx.borrow().is_empty());
 
         stack
@@ -4778,6 +4781,44 @@ pub(crate) mod test {
         );
     }
 
+    /// Neighbor resolution runs its course when the clock wraps around in the
+    /// middle of it, and every poll asks for the next retransmission on time.
+    #[test]
+    fn test_neighbor_failure_across_wraparound() {
+        let driver = TestDevice::new(Medium::Ethernet);
+        let tx = driver.tx.clone();
+        // 1.5 s before the clock wraps around.
+        let start = Instant::from_millis(0u32.wrapping_sub(1500));
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        stack
+            .iface(iface)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        stack.poll(start);
+        tx.borrow_mut().clear();
+
+        let dead = Ipv4Addr::new(192, 168, 1, 99);
+        let handle = stack.add_udp_socket().unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(5555, ListenSocketAddr::UNSPECIFIED)
+            .unwrap();
+        stack.udp_socket(handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
+
+        let at = |secs| start + Duration::from_secs(secs);
+        assert_eq!(stack.poll(start), at(1));
+        assert_eq!(stack.poll(at(1)), at(2));
+        assert_eq!(stack.poll(at(2)), at(3));
+        assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
+        stack.poll(at(3));
+        assert_eq!(
+            stack.udp_socket(handle).take_icmp_error(),
+            Some((IcmpError::HostUnreachable, SocketAddr::new(dead.into(), 1000)))
+        );
+        assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
+    }
+
     /// A route's expiry is a deadline, and the poll at it removes the route.
     #[test]
     fn test_expired_route_removed() {
@@ -5432,7 +5473,7 @@ pub(crate) mod test {
         let deadline = stack.poll(Instant::from_secs(5));
         assert_eq!(tx.borrow().len(), 1);
         assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Ipv4);
-        assert!(deadline > Instant::from_secs(5) && deadline < Instant::MAX);
+        assert!(deadline > Instant::from_secs(5) && deadline < idle_deadline(Instant::from_secs(5)));
         assert_eq!(stack.poll(Instant::from_secs(5)), deadline);
         assert_eq!(tx.borrow().len(), 1);
     }
@@ -6197,21 +6238,27 @@ pub(crate) mod test {
         let frag2 = ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, false, 24, &[0xBB; 6]);
 
         // The first fragment starts the timeout.
-        assert_eq!(stack.poll(Instant::ZERO), Instant::MAX);
+        assert_eq!(stack.poll(Instant::ZERO), idle_deadline(Instant::ZERO));
         rx.borrow_mut().push_back(frag1.clone());
         assert_eq!(stack.poll(Instant::from_secs(1)), Instant::from_secs(11));
         assert!(!stack.raw_socket(handle).can_recv());
 
         // Past the timeout the fragment is forgotten: the last fragment alone does
         // not complete the packet, it starts a new reassembly instead.
-        assert_eq!(stack.poll(Instant::from_secs(12)), Instant::MAX);
+        assert_eq!(
+            stack.poll(Instant::from_secs(12)),
+            idle_deadline(Instant::from_secs(12))
+        );
         rx.borrow_mut().push_back(frag2.clone());
         assert_eq!(stack.poll(Instant::from_secs(12)), Instant::from_secs(22));
         assert!(!stack.raw_socket(handle).can_recv());
 
         // Within the timeout, both fragments make the packet.
         rx.borrow_mut().push_back(frag1);
-        assert_eq!(stack.poll(Instant::from_secs(13)), Instant::MAX);
+        assert_eq!(
+            stack.poll(Instant::from_secs(13)),
+            idle_deadline(Instant::from_secs(13))
+        );
         assert!(stack.raw_socket(handle).can_recv());
         assert_eq!(stack.raw_socket(handle).recv().unwrap().len(), IPV4_HEADER_LEN + 30);
     }
@@ -6238,14 +6285,14 @@ pub(crate) mod test {
         let frag2 = ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, false, 24, &[0xBB; 6]);
 
         rx.borrow_mut().push_back(frag1.clone());
-        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(1)), idle_deadline(Instant::from_secs(1)));
         rx.borrow_mut().push_back(frag2.clone());
-        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(1)), idle_deadline(Instant::from_secs(1)));
         assert!(!stack.raw_socket(handle).can_recv());
 
         rx.borrow_mut().push_back(frag1);
         rx.borrow_mut().push_back(frag2);
-        assert_eq!(stack.poll(Instant::from_secs(2)), Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(2)), idle_deadline(Instant::from_secs(2)));
         assert_eq!(stack.raw_socket(handle).recv().unwrap().len(), IPV4_HEADER_LEN + 30);
     }
 

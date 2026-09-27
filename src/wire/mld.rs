@@ -286,13 +286,13 @@ impl<'a> AddressRecord<'a> {
 }
 
 /// The longest maximum response delay the code field can encode, in milliseconds.
-const MAX_RESP_DELAY_MAX_MILLIS: u64 = 0x1FFF << 10;
+const MAX_RESP_DELAY_MAX_MILLIS: u32 = 0x1FFF << 10;
 
 // RFC 3810 §5.1.3: a code below 32768 is the delay in milliseconds, a code of
 // 32768 or more is a floating point value, `(mant | 0x1000) << (exp + 3)`, with
 // a 3-bit exponent and a 12-bit mantissa.
 const fn max_resp_code_to_delay(code: u16) -> Duration {
-    let code = code as u64;
+    let code = code as u32;
     let millis = if code < 0x8000 {
         code
     } else {

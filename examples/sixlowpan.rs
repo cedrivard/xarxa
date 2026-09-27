@@ -140,15 +140,9 @@ fn main() {
 
         let deadline = stack.poll(Instant::now());
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

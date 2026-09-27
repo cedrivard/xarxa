@@ -347,7 +347,7 @@ mod test {
     }
 
     /// Poll the table at `at_millis`, then look up and return (via_router, iface).
-    fn lookup(routes: &mut Routes, addr: Ipv6Addr, at_millis: i64) -> Option<(IpAddr, IfaceHandle)> {
+    fn lookup(routes: &mut Routes, addr: Ipv6Addr, at_millis: u32) -> Option<(IpAddr, IfaceHandle)> {
         routes.remove_expired(&mut Clock::new(Instant::from_millis(at_millis)));
         routes
             .lookup(IfaceBinding::Any, &addr.into())

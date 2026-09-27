@@ -167,7 +167,7 @@ impl<'a> Packet<'a> {
 }
 
 fn max_resp_code_to_duration(value: u8) -> Duration {
-    let value: u64 = value.into();
+    let value: u32 = value.into();
     let decisecs = if value < 128 {
         value
     } else {

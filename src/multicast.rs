@@ -591,7 +591,7 @@ impl IfaceState<'_> {
         // 32768 and above (RFC 3810 §5.1.3), so it can be longer than 65535 ms.
         let max_resp_delay = icmp_packet.max_resp_delay().as_millis();
         let delay = if max_resp_delay > 0 {
-            Duration::from_millis(u64::from(inner.rand.rand_u32()) % max_resp_delay)
+            Duration::from_millis(inner.rand.rand_u32() % max_resp_delay)
         } else {
             Duration::ZERO
         };
@@ -710,6 +710,7 @@ mod test {
     use crate::iface::Medium;
     use crate::stack::Stack;
     use crate::test_device::{Link, Queue, Sent, TestDevice};
+    use crate::time::idle_deadline;
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const REMOTE_HW: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
@@ -967,7 +968,7 @@ mod test {
                 assert!(stack.iface(IFACE).has_multicast_group(*group));
             }
             assert!(stack.iface(IFACE).has_multicast_group(IPV4_MULTICAST_ALL_SYSTEMS));
-            assert_eq!(stack.poll(timestamp), Instant::MAX);
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
 
             let reports = recv_igmp(medium, &tx);
             assert_eq!(reports.len(), 2);
@@ -1005,7 +1006,7 @@ mod test {
                 recv_igmp(medium, &tx),
                 [(OUR_V4, groups[1], 1, IgmpMessage::MembershipReportV2, groups[1])]
             );
-            assert_eq!(stack.poll(deadline), Instant::MAX);
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
             assert!(recv_igmp(medium, &tx).is_empty());
 
             // Group-specific query: only the queried group is reported, after a
@@ -1020,7 +1021,7 @@ mod test {
             let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, timestamp);
             assert_eq!(deadline, timestamp + max_resp_time / 4);
             assert!(recv_igmp(medium, &tx).is_empty());
-            assert_eq!(stack.poll(deadline), Instant::MAX);
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
             assert_eq!(
                 recv_igmp(medium, &tx),
                 [(OUR_V4, groups[1], 1, IgmpMessage::MembershipReportV2, groups[1])]
@@ -1031,7 +1032,7 @@ mod test {
             let query = igmp_packet(REMOTE_V4, other, IgmpMessage::MembershipQuery, max_resp_time, other);
             assert_eq!(
                 inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, timestamp),
-                Instant::MAX
+                idle_deadline(timestamp)
             );
 
             // Leave multicast groups
@@ -1094,7 +1095,7 @@ mod test {
                 ]
             );
             // The next look for a group to report finds none left.
-            assert_eq!(stack.poll(deadline), Instant::MAX);
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
             assert!(recv_igmp(medium, &tx).is_empty());
         }
     }
@@ -1212,7 +1213,7 @@ mod test {
             assert!(recv_mld(medium, &tx).is_empty());
 
             timestamp += Duration::from_millis(1000);
-            assert_eq!(stack.poll(timestamp), Instant::MAX);
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
 
             let expected_records = results
                 .iter()
@@ -1234,13 +1235,13 @@ mod test {
         );
         assert_eq!(
             inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp),
-            Instant::MAX
+            idle_deadline(timestamp)
         );
         let mut query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 1000);
         Ipv6Packet::new_unchecked(&mut query[..]).set_hop_limit(64);
         assert_eq!(
             inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp),
-            Instant::MAX
+            idle_deadline(timestamp)
         );
     }
 
@@ -1260,7 +1261,7 @@ mod test {
         // Code 0: the report goes out in the same poll that handles the query.
         let query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 0);
         let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp);
-        assert_eq!(deadline, Instant::MAX);
+        assert_eq!(deadline, idle_deadline(timestamp));
         assert_eq!(
             recv_mld(medium, &tx),
             [(OUR_LL, IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS, 1, expected_records.clone())]
@@ -1280,7 +1281,7 @@ mod test {
             assert!(recv_mld(medium, &tx).is_empty());
 
             timestamp += max_resp_delay;
-            assert_eq!(stack.poll(timestamp), Instant::MAX);
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
             assert_eq!(
                 recv_mld(medium, &tx),
                 [(OUR_LL, IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS, 1, expected_records.clone())]

@@ -42,19 +42,19 @@ impl<'a> Packet<'a> {
     /// Return the router lifetime field.
     #[inline]
     pub fn router_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u16(&self.buffer[field::ROUTER_LT]) as u64)
+        Duration::from_secs(NetworkEndian::read_u16(&self.buffer[field::ROUTER_LT]).into())
     }
 
     /// Return the reachable time field.
     #[inline]
     pub fn reachable_time(&self) -> Duration {
-        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::REACHABLE_TM]) as u64)
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::REACHABLE_TM]))
     }
 
     /// Return the retransmit time field.
     #[inline]
     pub fn retrans_time(&self) -> Duration {
-        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::RETRANS_TM]) as u64)
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::RETRANS_TM]))
     }
 }
 
@@ -122,13 +122,13 @@ impl<'a> Packet<'a> {
     /// Set the reachable time field.
     #[inline]
     pub fn set_reachable_time(&mut self, value: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::REACHABLE_TM], value.as_millis() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::REACHABLE_TM], value.as_millis());
     }
 
     /// Set the retransmit time field.
     #[inline]
     pub fn set_retrans_time(&mut self, value: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::RETRANS_TM], value.as_millis() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::RETRANS_TM], value.as_millis());
     }
 }
 

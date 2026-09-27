@@ -211,10 +211,10 @@ impl Slaac {
         self.sync_required = true;
     }
 
-    fn expire_prefix(&mut self, cidr: &Ipv6Cidr) {
+    fn expire_prefix(&mut self, cidr: &Ipv6Cidr, now: Instant) {
         if let Some((_, info)) = self.prefix.iter_mut().find(|(c, _)| c == cidr) {
-            info.valid_until = Instant::from_millis(0);
-            info.preferred_until = Instant::from_millis(0);
+            info.valid_until = now;
+            info.preferred_until = now;
             self.sync_required = true;
         }
     }
@@ -237,10 +237,10 @@ impl Slaac {
         self.sync_required = true;
     }
 
-    fn expire_route(&mut self, cidr: &Ipv6Cidr, via_router: &Ipv6Addr) {
+    fn expire_route(&mut self, cidr: &Ipv6Cidr, via_router: &Ipv6Addr, now: Instant) {
         for route in self.routes.iter_mut() {
             if route.same_route(cidr, via_router) {
-                route.valid_until = Instant::from_millis(0);
+                route.valid_until = now;
                 self.sync_required = true;
             }
         }
@@ -256,7 +256,7 @@ impl Slaac {
         if prefix.valid_lifetime > Duration::ZERO {
             self.add_prefix(&cidr, &prefix, now);
         } else {
-            self.expire_prefix(&cidr);
+            self.expire_prefix(&cidr, now);
         }
     }
 
@@ -281,7 +281,7 @@ impl Slaac {
         if router_lifetime > Duration::ZERO {
             self.add_route(&IPV6_DEFAULT, source, now + router_lifetime);
         } else {
-            self.expire_route(&IPV6_DEFAULT, source);
+            self.expire_route(&IPV6_DEFAULT, source, now);
         }
 
         self.state.routers_seen = true;
@@ -334,14 +334,6 @@ impl Slaac {
             Phase::Start => self.num_solicitations > 0,
             Phase::Discovering { retry_rs_at } if self.num_solicitations > 0 => clock.expired(retry_rs_at),
             _ => false,
-        }
-    }
-
-    /// When the next router solicitation is due. `Instant::MAX` if none is.
-    fn rs_at(&self) -> Instant {
-        match self.phase {
-            Phase::Discovering { retry_rs_at } if self.num_solicitations > 0 => retry_rs_at,
-            _ => Instant::MAX,
         }
     }
 
@@ -616,7 +608,11 @@ impl IfaceState<'_> {
         }
         let slaac = self.slaac.as_mut().unwrap();
         slaac.rs_sent(clock.now());
-        clock.schedule(slaac.rs_at());
+        if let Phase::Discovering { retry_rs_at } = slaac.phase
+            && slaac.num_solicitations > 0
+        {
+            clock.schedule(retry_rs_at);
+        }
     }
 
     /// Turn SLAAC off: remove the addresses and routes it installed.
@@ -640,6 +636,7 @@ impl IfaceState<'_> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::time::idle_deadline;
     #[allow(unused_imports)]
     use std::vec::Vec;
     mod mock {
@@ -738,7 +735,9 @@ mod test {
         assert_eq!(slaac.num_solicitations, 2);
         assert!(!slaac.rs_required(&mut Clock::new(now)));
 
-        let next_poll = slaac.rs_at();
+        let Phase::Discovering { retry_rs_at: next_poll } = slaac.phase else {
+            panic!("not soliciting");
+        };
         assert_eq!(next_poll, now + RTR_SOLICITATION_INTERVAL);
 
         let now = next_poll;
@@ -748,7 +747,6 @@ mod test {
         assert!(!slaac.rs_required(&mut Clock::new(now)));
         slaac.rs_sent(now);
         assert_eq!(slaac.phase, Phase::None);
-        assert_eq!(slaac.rs_at(), Instant::MAX);
     }
 
     #[test]
@@ -773,7 +771,6 @@ mod test {
         advertise(&mut slaac, VALID, Some(PREFIX), now);
         advertise(&mut slaac, VALID, Some(PREFIX), now);
         assert_eq!(slaac.phase, Phase::Maintaining);
-        assert_eq!(slaac.rs_at(), Instant::MAX);
         let (_, poll_at) = sync_required(&slaac, now);
         assert_eq!(poll_at, now + VALID);
 
@@ -816,7 +813,7 @@ mod test {
         let (_, poll_at) = sync_required(&slaac, now);
         let now = poll_at;
         // Expired, so it needs a sync and there is nothing left to wait for.
-        assert_eq!(sync_required(&slaac, now), (true, Instant::MAX));
+        assert_eq!(sync_required(&slaac, now), (true, idle_deadline(now)));
         for (_prefix, info) in slaac.prefix.iter() {
             assert!(!info.is_valid(now));
         }
@@ -826,7 +823,7 @@ mod test {
         assert_eq!(slaac.prefix.len(), 0);
 
         // No state remaining, nothing to wait on
-        assert_eq!(sync_required(&slaac, now), (false, Instant::MAX));
+        assert_eq!(sync_required(&slaac, now), (false, idle_deadline(now)));
     }
 
     /// A multicast prefix would form a multicast address. It is ignored.
@@ -900,6 +897,6 @@ mod test {
         assert_eq!(slaac.routes.len(), 0);
         assert!(!sync_required(&slaac, now).0);
         // No state remaining, nothing to wait on
-        assert_eq!(sync_required(&slaac, now), (false, Instant::MAX));
+        assert_eq!(sync_required(&slaac, now), (false, idle_deadline(now)));
     }
 }

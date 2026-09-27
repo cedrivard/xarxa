@@ -337,10 +337,12 @@ impl Client {
             return None;
         }
 
+        // A lease longer than `Duration::MAX`, the infinite one of all ones
+        // included (RFC 2131 §3.3), is cut to that, and renewed early.
         let mut lease_duration = packet
             .option(field::OPT_IP_LEASE_TIME)
             .and_then(parse_u32)
-            .map(|d| Duration::from_secs(d as _))
+            .map(Duration::from_secs)
             .unwrap_or(DEFAULT_LEASE_DURATION);
         if let Some(max_lease_duration) = max_lease_duration {
             lease_duration = lease_duration.min(max_lease_duration);
@@ -394,11 +396,11 @@ impl Client {
             packet
                 .option(field::OPT_RENEWAL_TIME_VALUE)
                 .and_then(parse_u32)
-                .map(|d| Duration::from_secs(d as u64)),
+                .map(Duration::from_secs),
             packet
                 .option(field::OPT_REBINDING_TIME_VALUE)
                 .and_then(parse_u32)
-                .map(|d| Duration::from_secs(d as u64)),
+                .map(Duration::from_secs),
         ) {
             (Some(renew_duration), Some(rebind_duration))
                 if renew_duration < rebind_duration && rebind_duration < lease_duration =>
@@ -414,7 +416,7 @@ impl Client {
             // be set to the default (0.875 * duration_of_lease).
             (Some(renew_duration), None) if renew_duration < lease_duration => (
                 renew_duration,
-                renew_duration + (lease_duration - renew_duration) * 3 / 4,
+                renew_duration + (lease_duration - renew_duration) / 4 * 3,
             ),
 
             // If only T2 is provided, then T1 will be set to be
@@ -428,7 +430,7 @@ impl Client {
             // T1 < T2 < lease_duration
             (_, _) => {
                 debug!("using default T1 and T2 values since the provided values are invalid");
-                (lease_duration / 2, lease_duration * 7 / 8)
+                (lease_duration / 2, lease_duration / 8 * 7)
             }
         };
         let renew_at = now + renew_duration;
@@ -934,8 +936,12 @@ mod test {
         (stack, rx, tx, link)
     }
 
-    fn at(secs: i64) -> Instant {
-        Instant::from_secs(secs)
+    /// When the tests' clock starts: five minutes before it wraps around, so the
+    /// timers of every test run across the wraparound.
+    const T0: Instant = Instant::from_millis(0u32.wrapping_sub(300_000));
+
+    fn at(secs: u32) -> Instant {
+        T0 + Duration::from_secs(secs)
     }
 
     /// A server reply as a whole Ethernet frame, unicast to our MAC and to `dst_ip`.
@@ -1527,8 +1533,8 @@ mod test {
         assert!(tx.borrow().is_empty());
     }
 
-    fn ms(millis: i64) -> Instant {
-        Instant::from_millis(millis)
+    fn ms(millis: u32) -> Instant {
+        T0 + Duration::from_millis(millis)
     }
 
     fn transaction_id(sent: &mut SentDhcp) -> u32 {
@@ -1935,7 +1941,7 @@ mod test {
                 IFACE,
                 IpAddr::V4(SERVER_IP),
                 HardwareAddress::Ethernet(SERVER_HW),
-                at(0) + Duration::from_secs(24 * 60 * 60),
+                T0 + Duration::MAX,
             )
             .unwrap();
 
@@ -1993,7 +1999,7 @@ mod test {
                 IFACE,
                 IpAddr::V4(SERVER_IP),
                 HardwareAddress::Ethernet(SERVER_HW),
-                at(0) + Duration::from_secs(24 * 60 * 60),
+                T0 + Duration::MAX,
             )
             .unwrap();
 

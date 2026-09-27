@@ -237,11 +237,11 @@ impl fmt::Display for State {
 /// RFC 6298: (2.1) Until a round-trip time (RTT) measurement has been made for a
 /// segment sent between the sender and receiver, the sender SHOULD
 /// set RTO <- 1 second,
-const RTTE_INITIAL_RTO: u32 = 1000;
+const RTTE_INITIAL_RTO: Duration = Duration::from_secs(1);
 
 // Minimum "safety margin" for the RTO that kicks in when the
 // variance gets very low.
-const RTTE_MIN_MARGIN: u32 = 5;
+const RTTE_MIN_MARGIN: Duration = Duration::from_millis(5);
 
 /// K, according to RFC 6298
 const RTTE_K: u32 = 4;
@@ -251,24 +251,23 @@ const RTTE_K: u32 = 4;
 // However, this is too slow in practice for modern fast links, so we match the
 // minimum RTO found within linux and other OSes.
 // <https://elixir.bootlin.com/linux/v7.2.6/source/include/net/tcp.h#L162>
-const RTTE_MIN_RTO: u32 = 200;
+const RTTE_MIN_RTO: Duration = Duration::from_millis(200);
 
 // RFC 6298 (2.5) A maximum value MAY be placed on RTO provided it is at least 60
 // seconds
-const RTTE_MAX_RTO: u32 = 60_000;
+const RTTE_MAX_RTO: Duration = Duration::from_secs(60);
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct RttEstimator {
     /// true if we have made at least one rtt measurement.
     have_measurement: bool,
-    // Using u32 instead of Duration to save space (Duration is i64)
     /// Smoothed RTT
-    srtt: u32,
+    srtt: Duration,
     /// RTT variance.
-    rttvar: u32,
+    rttvar: Duration,
     /// Retransmission Time-Out
-    rto: u32,
+    rto: Duration,
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
@@ -278,8 +277,8 @@ impl Default for RttEstimator {
     fn default() -> Self {
         Self {
             have_measurement: false,
-            srtt: 0,   // ignored, will be overwritten on first measurement.
-            rttvar: 0, // ignored, will be overwritten on first measurement.
+            srtt: Duration::ZERO,   // ignored, will be overwritten on first measurement.
+            rttvar: Duration::ZERO, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
             timestamp: None,
             max_seq_sent: None,
@@ -290,18 +289,22 @@ impl Default for RttEstimator {
 
 impl RttEstimator {
     fn retransmission_timeout(&self) -> Duration {
-        Duration::from_millis(self.rto as _)
+        self.rto
     }
 
     #[cfg(feature = "tcp-cubic")]
-    fn smoothed_rtt(&self) -> u32 {
-        if self.have_measurement { self.srtt } else { 0 }
+    fn smoothed_rtt(&self) -> Duration {
+        if self.have_measurement {
+            self.srtt
+        } else {
+            Duration::ZERO
+        }
     }
 
-    fn sample(&mut self, new_rtt: u32) {
+    fn sample(&mut self, new_rtt: Duration) {
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
-            let diff = (self.srtt as i32 - new_rtt as i32).unsigned_abs();
+            let diff = self.srtt.abs_diff(new_rtt);
             self.rttvar = (self.rttvar * 3 + diff).div_ceil(4);
             self.srtt = (self.srtt * 7 + new_rtt).div_ceil(8);
         } else {
@@ -337,7 +340,7 @@ impl RttEstimator {
         if let Some((sent_timestamp, sent_seq)) = self.timestamp
             && seq >= sent_seq
         {
-            self.sample((timestamp - sent_timestamp).as_millis() as u32);
+            self.sample(timestamp - sent_timestamp);
             self.timestamp = None;
         }
     }
@@ -858,7 +861,7 @@ impl<'d> TcpSocketState<'d> {
     #[cfg(feature = "tcp-timestamps")]
     fn timestamp_repr(&self, now: Instant, tsecr: u32) -> Option<TcpTimestampRepr> {
         self.timestamps.then(|| {
-            let tsval = (now.as_millis() as u32).wrapping_add(self.tsval_offset);
+            let tsval = now.as_millis().wrapping_add(self.tsval_offset);
             TcpTimestampRepr::new(tsval, tsecr)
         })
     }
@@ -2083,7 +2086,7 @@ impl<'d> TcpSocketState<'d> {
                 ..repr
             })?;
             self.ack_sent(repr.ack_number, repr.window_len);
-            let delay = (delay * 2).min(Duration::from_millis(RTTE_MAX_RTO as _));
+            let delay = (delay * 2).min(RTTE_MAX_RTO);
             self.timer = Timer::ZeroWindowProbe {
                 expires_at: clock.after(delay),
                 delay,
@@ -2408,7 +2411,7 @@ impl<'d> TcpSocket<'_, 'd> {
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
         let s = self.inner_mut();
         // With no timeout set, the time of the last packet received is never
-        // checked, and can be arbitrarily old.
+        // checked, and can get old enough to look like it is in the future.
         s.remote_last_ts = None;
         s.timeout = duration;
     }
@@ -3010,6 +3013,7 @@ mod test {
     use crate::iface::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
+    use crate::time::{MAX_POLL_DELAY, idle_deadline};
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Addr, Ipv6Addr};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
@@ -3282,7 +3286,7 @@ mod test {
         TestSocket {
             sockets,
             stack,
-            deadline: Instant::MAX,
+            deadline: idle_deadline(Instant::ZERO),
         }
     }
 
@@ -3503,7 +3507,7 @@ mod test {
                 sockets
             },
             stack,
-            deadline: Instant::MAX,
+            deadline: idle_deadline(Instant::ZERO),
         }
     }
 
@@ -3563,7 +3567,7 @@ mod test {
                 sockets
             },
             stack,
-            deadline: Instant::MAX,
+            deadline: idle_deadline(Instant::ZERO),
         };
         sanity!(&s, &socket_syn_received());
         recv!(
@@ -4010,7 +4014,7 @@ mod test {
                     sockets
                 },
                 stack,
-                deadline: Instant::MAX,
+                deadline: idle_deadline(Instant::ZERO),
             };
             recv!(
                 s,
@@ -4039,7 +4043,7 @@ mod test {
                 sockets
             },
             stack,
-            deadline: Instant::MAX,
+            deadline: idle_deadline(Instant::ZERO),
         };
         recv!(
             s,
@@ -6388,8 +6392,8 @@ mod test {
         );
     }
 
-    /// The challenge ACK rate limit doesn't come back to life on a connection that
-    /// stays idle for weeks.
+    /// The challenge ACK rate limit doesn't come back to life when the clock wraps
+    /// around on a connection that stays idle for weeks.
     #[test]
     fn test_challenge_ack_after_long_idle() {
         let mut s = socket_established();
@@ -6410,7 +6414,7 @@ mod test {
         // Idle for 30 days, polled once a day.
         let mut now = Instant::ZERO;
         for _ in 0..30 {
-            now += Duration::from_secs(24 * 60 * 60);
+            now += MAX_POLL_DELAY;
             recv_nothing(&mut s, now);
         }
         assert_eq!(send(&mut s, now, &bad_seq), Some(challenge_ack));
@@ -8288,7 +8292,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        let expected_retransmission_instant = s.rtte.retransmission_timeout().as_millis() as i64;
+        let expected_retransmission_instant = s.rtte.retransmission_timeout().as_millis();
         recv_nothing!(s, time expected_retransmission_instant - 1);
         recv!(s, time expected_retransmission_instant, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
@@ -8307,6 +8311,30 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    /// The retransmission timer fires on time when the clock wraps around while it
+    /// runs.
+    #[test]
+    fn test_retransmit_across_wraparound() {
+        let mut s = socket_established();
+        // 100 ms before the clock wraps around.
+        let start = 0u32.wrapping_sub(100);
+        recv_nothing!(s, time start);
+        s.view().send_slice(b"abcdef").unwrap();
+        let segment = TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        };
+        recv!(s, time start, Ok(segment));
+
+        let retransmit_at = start.wrapping_add(s.rtte.retransmission_timeout().as_millis());
+        assert!(retransmit_at < start);
+        assert_eq!(s.deadline, Instant::from_millis(retransmit_at));
+        recv_nothing!(s, time retransmit_at - 1);
+        recv!(s, time retransmit_at, Ok(segment));
     }
 
     #[test]
@@ -9363,7 +9391,7 @@ mod test {
         recv_nothing!(s, time 5000);
         s.view().send_slice(b"abcdef").unwrap();
 
-        let probe_at = 5000 + s.rtte.retransmission_timeout().as_millis() as i64;
+        let probe_at = 5000 + s.rtte.retransmission_timeout().as_millis();
         recv_nothing!(s, time 5000);
         assert_eq!(s.deadline, Instant::from_millis(probe_at));
         recv_nothing!(s, time probe_at - 1);
@@ -9576,7 +9604,7 @@ mod test {
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
         // Idle, nothing to send: no timeout.
-        assert_eq!(s.deadline, Instant::MAX);
+        assert_eq!(s.deadline, idle_deadline(Instant::from_millis(250)));
         s.view().send_slice(b"abcdef").unwrap();
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
@@ -9601,20 +9629,24 @@ mod test {
         assert_eq!(s.state, State::Closed);
     }
 
-    /// A timeout set on a connection that went unanswered for a long time counts
-    /// from when it is set, not from the last packet received, long before.
+    /// A timeout set on a connection that went unanswered for longer than the
+    /// clock takes to wrap around counts from when it is set. The time of the
+    /// last packet received, from long before, doesn't come back to life.
     #[test]
     fn test_timeout_set_after_long_silence() {
         let mut s = socket_established();
         s.view().send_slice(b"abcdef").unwrap();
 
         // The remote never answers, and the data is retransmitted for 30 days.
-        let mut now = 0i64;
-        while now < 30 * 24 * 60 * 60 * 1000 {
+        let mut now = 0u32;
+        let mut elapsed = 0u64;
+        while elapsed < 30 * 24 * 60 * 60 * 1000 {
             recv(&mut s, Instant::from_millis(now), 1, |_, repr| {
                 assert_eq!(repr.payload, &b"abcdef"[..]);
             });
-            now = s.deadline.as_millis();
+            let next = s.deadline.as_millis();
+            elapsed += u64::from(next.wrapping_sub(now));
+            now = next;
         }
 
         // The retransmissions go on until the timeout is up.
@@ -9622,7 +9654,7 @@ mod test {
         recv(&mut s, Instant::from_millis(now), 1, |_, repr| {
             assert_eq!(repr.payload, &b"abcdef"[..]);
         });
-        let timeout_at = now + 60_000;
+        let timeout_at = now.wrapping_add(60_000);
         assert_eq!(s.deadline, Instant::from_millis(timeout_at));
         recv!(s, time timeout_at, Ok(TcpRepr {
             control:    TcpControl::Rst,
@@ -9638,7 +9670,7 @@ mod test {
         let mut s = socket_established();
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 5000);
-        assert_eq!(s.deadline, Instant::MAX);
+        assert_eq!(s.deadline, idle_deadline(Instant::from_millis(5000)));
         assert_eq!(s.state, State::Established);
 
         // Receiving data does not arm the timeout either.
@@ -9654,7 +9686,7 @@ mod test {
             window_len: 58,
             ..RECV_TEMPL
         }));
-        assert_eq!(s.deadline, Instant::MAX);
+        assert_eq!(s.deadline, idle_deadline(Instant::from_millis(5100)));
         recv_nothing!(s, time 10000);
         assert_eq!(s.state, State::Established);
     }
@@ -9677,7 +9709,7 @@ mod test {
         });
         // Everything is ACKed: the timeout is disarmed.
         recv_nothing!(s, time 200);
-        assert_eq!(s.deadline, Instant::MAX);
+        assert_eq!(s.deadline, idle_deadline(Instant::from_millis(200)));
         recv_nothing!(s, time 5000);
         assert_eq!(s.state, State::Established);
 
@@ -9894,7 +9926,7 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.deadline, Instant::MAX);
+        assert_eq!(s.deadline, idle_deadline(Instant::from_millis(100)));
     }
 
     // =========================================================================================//
@@ -10344,7 +10376,7 @@ mod test {
 
     /// A challenge ACK acknowledges the data a delayed ACK was waiting for, which
     /// leaves the delayed ACK due. Weeks later it still is: the next data is
-    /// acknowledged at once.
+    /// acknowledged at once, not when its time would come around again.
     #[test]
     fn test_delayed_ack_after_long_idle() {
         let mut s = socket_established();
@@ -10378,7 +10410,7 @@ mod test {
         // Idle for 30 days, polled once a day.
         let mut now = Instant::from_millis(1);
         for _ in 0..30 {
-            now += Duration::from_secs(24 * 60 * 60);
+            now += MAX_POLL_DELAY;
             recv_nothing(&mut s, now);
         }
 
@@ -10840,7 +10872,7 @@ mod test {
         ];
 
         for &rto in rtos {
-            r.sample(2000);
+            r.sample(Duration::from_millis(2000));
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
     }

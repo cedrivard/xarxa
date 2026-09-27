@@ -352,7 +352,7 @@ impl DnsClient {
     /// `now` is the current time.
     ///
     /// Returns the next time `poll` should be called to retransmit a query or try
-    /// the next server, or [`Instant::MAX`] if no query is pending. It is always
+    /// the next server, or one day after `now` if no query is pending. It is always
     /// later than `now`. Call it after every [`Stack::poll`], and again when that
     /// deadline arrives.
     #[must_use]

@@ -108,6 +108,8 @@ fn main() {
     let ident = seed as u16;
     let mut seq: u16 = 0;
     let mut next_send = Instant::now();
+    // Echo requests carry their send time as nanoseconds since `start`.
+    let start = std::time::Instant::now();
     log::info!("pinging {target} with {DATA_LEN} bytes of data, ident {ident:#06x}");
 
     loop {
@@ -117,17 +119,16 @@ fn main() {
 
         // Drain received ICMP packets, printing the echo replies to our pings.
         while let Ok(mut packet) = socket.recv() {
-            let now = Instant::now();
+            let now = start.elapsed();
             if let Some(reply) = parse_reply(&mut packet, target, ident) {
-                let sent = Instant::from_micros(i64::from_le_bytes(reply.timestamp));
-                let rtt = now - sent;
+                let sent = std::time::Duration::from_nanos(u64::from_le_bytes(reply.timestamp));
+                let rtt = now.saturating_sub(sent);
                 log::info!(
-                    "{} bytes from {}: icmp_seq={} time={}.{:03}ms",
+                    "{} bytes from {}: icmp_seq={} time={:.3}ms",
                     reply.data_len,
                     target,
                     reply.seq,
-                    rtt.as_micros() / 1000,
-                    rtt.as_micros() % 1000,
+                    rtt.as_secs_f64() * 1000.0,
                 );
             }
         }
@@ -135,26 +136,27 @@ fn main() {
         // Send the next request when it is due.
         let now = Instant::now();
         if now >= next_send {
-            send_request(&mut socket, target, ident, seq, now);
+            send_request(&mut socket, target, ident, seq, start);
             seq = seq.wrapping_add(1);
             next_send = now + INTERVAL;
         }
 
         let deadline = stack_deadline.min(next_send);
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 
 /// Build and send one echo request.
-fn send_request(socket: &mut xarxa::raw::RawSocket<'_, '_>, target: IpAddr, ident: u16, seq: u16, now: Instant) {
+fn send_request(
+    socket: &mut xarxa::raw::RawSocket<'_, '_>,
+    target: IpAddr,
+    ident: u16,
+    seq: u16,
+    start: std::time::Instant,
+) {
+    let now = start.elapsed().as_nanos() as u64;
     let res = match target {
         IpAddr::V4(dst) => {
             let src = Ipv4Addr::new(192, 168, 69, 1);
@@ -175,7 +177,7 @@ fn send_request(socket: &mut xarxa::raw::RawSocket<'_, '_>, target: IpAddr, iden
                 icmp.set_msg_code(0);
                 icmp.set_echo_ident(ident);
                 icmp.set_echo_seq_no(seq);
-                icmp.data_mut()[..8].copy_from_slice(&now.as_micros().to_le_bytes());
+                icmp.data_mut()[..8].copy_from_slice(&now.to_le_bytes());
                 icmp.fill_checksum();
                 total
             })
@@ -202,7 +204,7 @@ fn send_request(socket: &mut xarxa::raw::RawSocket<'_, '_>, target: IpAddr, iden
                 icmp.set_msg_code(0);
                 icmp.set_echo_ident(ident);
                 icmp.set_echo_seq_no(seq);
-                icmp.payload_mut()[..8].copy_from_slice(&now.as_micros().to_le_bytes());
+                icmp.payload_mut()[..8].copy_from_slice(&now.to_le_bytes());
                 icmp.fill_checksum(&src, &dst);
                 total
             })
