@@ -53,13 +53,7 @@ pub const PACKET_BUF_ALIGN: usize = cfg_select! {
 };
 
 const fn packet_buf_driver_headroom(cfg_head: usize) -> usize {
-    if cfg_head == 0 {
-        0
-    } else if PACKET_BUF_ALIGN > cfg_head {
-        PACKET_BUF_ALIGN
-    } else {
-        cfg_head
-    }
+    cfg_head.next_multiple_of(PACKET_BUF_ALIGN)
 }
 
 /// Default headroom of the buffer in a [`PacketBuf`](crate::PacketBuf), in bytes.
