@@ -528,8 +528,6 @@ impl fmt::Display for ListenSocketAddr {
 }
 
 pub mod checksum {
-    use byteorder::{ByteOrder, NetworkEndian};
-
     use super::*;
 
     const fn propagate_carries(word: u32) -> u16 {
@@ -538,7 +536,14 @@ pub mod checksum {
     }
 
     /// Compute an RFC 1071 compliant checksum (without the final complement).
+    #[inline(never)]
     pub fn data(data: &[u8]) -> u16 {
+        u16::to_be(propagate_carries(sum(data)))
+    }
+
+    /// Sum the 16-bit words of `data` in native-endian, without folding the carries.
+    #[inline(always)]
+    fn sum(data: &[u8]) -> u32 {
         // We calculate the sum in native-endian before converting to big-endian at the end
         // see RFC 1071 section 2.(B) for details
         let mut accum: u32 = 0;
@@ -567,8 +572,7 @@ pub mod checksum {
             accum += u16::from_ne_bytes([value, 0]) as u32;
         }
 
-        let collapsed = propagate_carries(accum);
-        u16::to_be(collapsed)
+        accum
     }
 
     /// Combine several RFC 1071 compliant checksums.
@@ -581,21 +585,28 @@ pub mod checksum {
     }
 
     #[cfg(feature = "ipv4")]
+    #[inline(never)]
     pub fn pseudo_header_v4(src_addr: &Ipv4Addr, dst_addr: &Ipv4Addr, next_header: Protocol, length: u32) -> u16 {
-        let mut proto_len = [0u8; 4];
-        proto_len[1] = next_header.into();
-        NetworkEndian::write_u16(&mut proto_len[2..4], length as u16);
-
-        combine(&[data(&src_addr.octets()), data(&dst_addr.octets()), data(&proto_len[..])])
+        // RFC 768: source, destination, zero, protocol, length. The addresses are
+        // summed where they are. `sum` reads network-order words as native-endian
+        // ones, so the protocol and length are byte-swapped to match.
+        let proto_len = u32::from(u16::from(u8::from(next_header)).to_be()) + u32::from((length as u16).to_be());
+        u16::to_be(propagate_carries(
+            sum(&src_addr.octets()) + sum(&dst_addr.octets()) + proto_len,
+        ))
     }
 
     #[cfg(feature = "ipv6")]
+    #[inline(never)]
     pub fn pseudo_header_v6(src_addr: &Ipv6Addr, dst_addr: &Ipv6Addr, next_header: Protocol, length: u32) -> u16 {
-        let mut proto_len = [0u8; 4];
-        proto_len[1] = next_header.into();
-        NetworkEndian::write_u16(&mut proto_len[2..4], length as u16);
-
-        combine(&[data(&src_addr.octets()), data(&dst_addr.octets()), data(&proto_len[..])])
+        // RFC 8200 §8.1: source, destination, upper-layer length, zero, next header.
+        // Summed like the IPv4 one.
+        let len_nh = u32::from(((length >> 16) as u16).to_be())
+            + u32::from((length as u16).to_be())
+            + u32::from(u16::from(u8::from(next_header)).to_be());
+        u16::to_be(propagate_carries(
+            sum(&src_addr.octets()) + sum(&dst_addr.octets()) + len_nh,
+        ))
     }
 
     pub fn pseudo_header(src_addr: &Address, dst_addr: &Address, next_header: Protocol, length: u32) -> u16 {
@@ -731,5 +742,32 @@ pub(crate) mod test {
             port: 8080,
         };
         assert_eq!("[::1]:8080", format!("{endpoint}"));
+    }
+
+    #[test]
+    fn test_pseudo_header_checksums() {
+        let src4 = Ipv4Addr::new(192, 168, 1, 0xfe);
+        let dst4 = Ipv4Addr::new(10, 0xff, 0x80, 1);
+        let mut header = [0u8; 12];
+        header[0..4].copy_from_slice(&src4.octets());
+        header[4..8].copy_from_slice(&dst4.octets());
+        header[9] = IpProtocol::Tcp.into();
+        header[10..12].copy_from_slice(&0xfedcu16.to_be_bytes());
+        assert_eq!(
+            checksum::pseudo_header_v4(&src4, &dst4, IpProtocol::Tcp, 0xfedc),
+            checksum::data(&header)
+        );
+
+        let src6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0x56ff, 0xfe78, 0x9abc);
+        let dst6 = Ipv6Addr::new(0xff02, 0xffff, 0, 0, 0, 0, 1, 0xff00);
+        let mut header = [0u8; 40];
+        header[0..16].copy_from_slice(&src6.octets());
+        header[16..32].copy_from_slice(&dst6.octets());
+        header[32..36].copy_from_slice(&0x0001_fedcu32.to_be_bytes());
+        header[39] = IpProtocol::Udp.into();
+        assert_eq!(
+            checksum::pseudo_header_v6(&src6, &dst6, IpProtocol::Udp, 0x0001_fedc),
+            checksum::data(&header)
+        );
     }
 }
