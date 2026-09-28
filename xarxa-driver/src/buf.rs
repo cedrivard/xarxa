@@ -176,7 +176,9 @@ impl PacketBuf {
     ///
     /// - Zero headroom, len.
     /// - Default metadata.
-    /// - **Uninitialized** data.
+    /// - **Uncleared** storage.
+    ///
+    /// Storage is not cleared and may contain data from previous, unrelated packets.
     pub fn try_new() -> Option<Self> {
         let index = alloc_slot()?;
         let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
@@ -309,6 +311,8 @@ impl PacketBuf {
     }
 
     /// Set the payload length, growing or shrinking it at the back.
+    ///
+    /// This does not clear newly exposed bytes.
     ///
     /// # Panics
     /// Panics if `headroom + len > capacity`.
