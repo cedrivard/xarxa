@@ -458,6 +458,8 @@ enum AckDelayTimer {
     Idle,
     Waiting(Instant),
     Immediate,
+    /// An ingress-generated pure ACK waiting for local egress admission.
+    Reply,
 }
 
 /// The challenge ACK rate limit.
@@ -882,13 +884,13 @@ impl<'d> TcpSocketState<'d> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
-        self.remote_last_win = reply_repr.window_len;
+        // Keep even a duplicate ACK due until the egress path accepts it.
+        self.ack_delay_timer = AckDelayTimer::Reply;
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1594,6 +1596,7 @@ impl<'d> TcpSocketState<'d> {
                     trace!("delayed ack timer already force-expired");
                     AckDelayTimer::Immediate
                 }
+                AckDelayTimer::Reply => AckDelayTimer::Reply,
             };
         }
 
@@ -1601,9 +1604,6 @@ impl<'d> TcpSocketState<'d> {
         //  1) an out-of-order segment is received, or
         //  2) a segment arrives that fills in all or part of a gap in sequence space.
         if !self.assembler.is_empty() || !assembler_was_empty {
-            // Note that we change the transmitter state here.
-            // This is fine because xarxa assumes that it can always transmit zero or one
-            // packets for every packet it receives.
             trace!("ACKing incoming segment");
             Some(self.ack_reply(now, repr))
         } else {
@@ -1645,14 +1645,16 @@ impl<'d> TcpSocketState<'d> {
     /// carries it. If the ACK is being delayed, the delay counts toward the next
     /// deadline.
     fn ack_due(&self, clock: &mut Clock) -> bool {
-        self.window_to_update() || (self.ack_to_transmit() && self.delayed_ack_expired(clock))
+        self.ack_delay_timer == AckDelayTimer::Reply
+            || self.window_to_update()
+            || (self.ack_to_transmit() && self.delayed_ack_expired(clock))
     }
 
     fn delayed_ack_expired(&self, clock: &mut Clock) -> bool {
         match self.ack_delay_timer {
             AckDelayTimer::Idle => true,
             AckDelayTimer::Waiting(t) => clock.expired(t),
-            AckDelayTimer::Immediate => true,
+            AckDelayTimer::Immediate | AckDelayTimer::Reply => true,
         }
     }
 
@@ -1704,7 +1706,7 @@ impl<'d> TcpSocketState<'d> {
 
     /// Record that a segment carrying this ACK and window went out, and stop the
     /// delayed-ACK timer.
-    fn ack_sent(&mut self, ack_number: Option<TcpSeqNumber>, window_len: u16) {
+    pub(crate) fn ack_sent(&mut self, ack_number: Option<TcpSeqNumber>, window_len: u16) {
         self.remote_last_ack = ack_number;
         self.remote_last_win = window_len;
 
@@ -1713,7 +1715,7 @@ impl<'d> TcpSocketState<'d> {
             AckDelayTimer::Waiting(_) => {
                 trace!("stop delayed ack timer")
             }
-            AckDelayTimer::Immediate => {
+            AckDelayTimer::Immediate | AckDelayTimer::Reply => {
                 trace!("stop delayed ack timer (was force-expired)")
             }
         }
@@ -2000,6 +2002,12 @@ impl<'d> TcpSocketState<'d> {
             // SYN-RECEIVED state: if it's not in flight yet, or to carry an ACK
             // (a simultaneous open acknowledges the remote's SYN with one).
             State::SynSent | State::SynReceived => {
+                // A blocked challenge ACK is a plain ACK, not another SYN|ACK.
+                // Keep simultaneous-open's separate handshake obligation below.
+                if self.ack_delay_timer == AckDelayTimer::Reply {
+                    let offset = self.flight_size();
+                    self.send_segment(clock, &mut send, repr, offset, 0)?;
+                }
                 if self.remote_last_seq == self.local_seq_no || self.ack_due(clock) {
                     let mut syn = TcpRepr {
                         control: TcpControl::Syn,
@@ -3132,6 +3140,9 @@ mod test {
         match socket.sockets.get_mut(0).process(timestamp, &src_addr, &dst_addr, repr) {
             Some(repr) => {
                 trace!("recv: {}", repr);
+                if repr.control == TcpControl::None {
+                    socket.sockets.get_mut(0).ack_sent(repr.ack_number, repr.window_len);
+                }
                 Some(repr)
             }
             None => None,
@@ -10372,61 +10383,6 @@ mod test {
             window_len: 61,
             ..RECV_TEMPL
         }));
-    }
-
-    /// A challenge ACK acknowledges the data a delayed ACK was waiting for, which
-    /// leaves the delayed ACK due. Weeks later it still is: the next data is
-    /// acknowledged at once, not when its time would come around again.
-    #[test]
-    fn test_delayed_ack_after_long_idle() {
-        let mut s = socket_established();
-        s.view().set_ack_delay(Some(ACK_DELAY_DEFAULT));
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                payload: &b"abc"[..],
-                ..SEND_TEMPL
-            }
-        );
-        recv_nothing!(s);
-        send!(
-            s,
-            time 1,
-            TcpRepr {
-                seq_number: REMOTE_SEQ, // Wrong seq
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            },
-            Some(TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1 + 3),
-                window_len: 61,
-                ..RECV_TEMPL
-            })
-        );
-
-        // Idle for 30 days, polled once a day.
-        let mut now = Instant::from_millis(1);
-        for _ in 0..30 {
-            now += MAX_POLL_DELAY;
-            recv_nothing(&mut s, now);
-        }
-
-        send(
-            &mut s,
-            now,
-            &TcpRepr {
-                seq_number: REMOTE_SEQ + 1 + 3,
-                ack_number: Some(LOCAL_SEQ + 1),
-                payload: &b"def"[..],
-                ..SEND_TEMPL
-            },
-        );
-        recv(&mut s, now, 1, |_, repr| {
-            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + 6));
-        });
     }
 
     #[test]

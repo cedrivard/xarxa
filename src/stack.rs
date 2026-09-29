@@ -1509,20 +1509,26 @@ impl<'d> Stack<'d> {
         };
 
         // Connected sockets: exact 4-tuple match. Immediate replies the socket
-        // state machine produces (RST, challenge ACK) are transmitted after the
+        // state machine produces (RST, immediate ACK) are transmitted after the
         // loop, once the socket borrow has ended.
-        let mut matched = false;
+        let mut matched = None;
         let mut reply_repr = None;
-        for (_, socket) in self.sockets.tcp.iter_mut() {
+        for (index, socket) in self.sockets.tcp.iter_mut() {
             if socket.binding_matches(iface) && socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
-                matched = true;
+                matched = Some(index);
                 reply_repr = socket.process(now, &src_addr, &dst_addr, &tcp_repr);
                 break;
             }
         }
-        if matched {
-            if let Some(reply) = reply_repr {
-                self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr);
+        if let Some(index) = matched {
+            if let Some(reply) = reply_repr
+                && self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr)
+                && reply.control == TcpControl::None
+            {
+                self.sockets
+                    .tcp
+                    .get_mut(index)
+                    .ack_sent(reply.ack_number, reply.window_len);
             }
             return;
         }
@@ -1546,20 +1552,36 @@ impl<'d> Stack<'d> {
     }
 
     /// Build and transmit an immediate reply to an ingress TCP segment: an RST, or
-    /// a challenge ACK from a socket's state machine.
+    /// an immediate ACK from a socket's state machine.
     ///
     /// The reply is routed before it is built, since its checksum is the egress
     /// interface's to compute and that is not necessarily the arrival one. It is
-    /// dropped if there is no route, or if the pool is empty.
+    /// not admitted if there is no route, the device is busy, or the pool is empty.
+    /// Socket ACKs stay due until this returns true, and dispatch retries them.
     #[cfg(feature = "tcp")]
-    fn transmit_tcp_reply(&mut self, arrival: IfaceHandle, repr: &TcpRepr<'_>, src_addr: IpAddr, dst_addr: IpAddr) {
+    fn transmit_tcp_reply(
+        &mut self,
+        arrival: IfaceHandle,
+        repr: &TcpRepr<'_>,
+        src_addr: IpAddr,
+        dst_addr: IpAddr,
+    ) -> bool {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
-            return;
+            return false;
         };
+        if self
+            .ifaces
+            .get_mut(route.iface.index())
+            .can_transmit_new_packet()
+            .is_err()
+        {
+            return false;
+        }
         let Some(buf) = crate::tcp::build_tcp_packet(repr, &src_addr, &dst_addr, &checksum_caps) else {
-            return;
+            return false;
         };
         self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
+        true
     }
 
     #[cfg(feature = "ipv4")]
