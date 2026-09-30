@@ -44,7 +44,7 @@ use crate::route::Routes;
 use crate::storage::BoundedDeque;
 use crate::storage::{MaybeBox, Slab, Vec};
 #[cfg(feature = "tcp")]
-use crate::tcp::{SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketIter, TcpSocketState};
+use crate::tcp::{ProcessResult, SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketIter, TcpSocketState};
 #[cfg(feature = "tcp-listener")]
 use crate::tcp::{TcpListener, TcpListenerHandle, TcpListenerIter, TcpListenerState};
 use crate::time::{Clock, Instant};
@@ -1472,15 +1472,14 @@ impl<'d> Stack<'d> {
     }
 
     /// Process an ingress TCP segment: validate it and hand it to the matching
-    /// socket, transmitting whatever immediate reply the socket state machine
-    /// produces (RST, challenge ACK). Connected sockets match first, by full
-    /// 4-tuple, then the listeners, which record SYNs to a listened address in
-    /// their accept queues and transmit nothing (the SYN|ACK is sent by the
-    /// socket the attempt is accepted into). Unmatched segments are answered
-    /// with an RST.
+    /// socket. Connected sockets match first, by full 4-tuple, then the listeners,
+    /// which record SYNs to a listened address in their accept queues and transmit
+    /// nothing (the SYN|ACK is sent by the socket the attempt is accepted into).
+    /// Unmatched segments, and segments a socket rejects, are answered with an RST.
     ///
-    /// The socket's own transmissions (data, ACKs of received data) are not sent
-    /// here. [`Stack::poll`] drives them right after ingress processing.
+    /// That RST is the only thing sent here. Everything else the segment calls
+    /// for (data, ACKs, challenge ACKs) the socket sends from its own egress,
+    /// which [`Stack::poll`] drives right after ingress processing.
     #[cfg(feature = "tcp")]
     fn process_tcp(
         &mut self,
@@ -1512,51 +1511,49 @@ impl<'d> Stack<'d> {
             return;
         };
 
-        // Connected sockets: exact 4-tuple match. Immediate replies the socket
-        // state machine produces (RST, challenge ACK) are transmitted after the
-        // loop, once the socket borrow has ended.
+        // Connected sockets: exact 4-tuple match.
         let mut matched = false;
-        let mut reply_repr = None;
+        let mut result = ProcessResult::None;
         for (_, socket) in self.sockets.tcp.iter_mut() {
             if socket.binding_matches(iface) && socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 matched = true;
-                reply_repr = socket.process(now, &src_addr, &dst_addr, &tcp_repr);
+                result = socket.process(now, &src_addr, &dst_addr, &tcp_repr);
                 break;
             }
         }
-        if matched {
-            if let Some(reply) = reply_repr {
-                self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr);
+
+        if !matched {
+            // Listeners: a SYN to a listened address is recorded in the accept
+            // queue of the most specific matching listener (exact local address
+            // beats wildcard), and an RST aimed at a recorded SYN cancels it.
+            // Nothing is replied, the handshake starts when the connection is
+            // accepted.
+            #[cfg(feature = "tcp-listener")]
+            if crate::tcp::process_listeners(&mut self.sockets.tcp_listeners, iface, &src_addr, &dst_addr, &tcp_repr) {
+                return;
             }
-            return;
+
+            // The packet wasn't handled by a socket: send a TCP RST packet.
+            // Never reply to a TCP RST packet with another TCP RST packet.
+            if tcp_repr.control != TcpControl::Rst {
+                result = ProcessResult::Rst;
+            }
         }
 
-        // Listeners: a SYN to a listened address is recorded in the accept
-        // queue of the most specific matching listener (exact local address
-        // beats wildcard), and an RST aimed at a recorded SYN cancels it.
-        // Nothing is replied, the handshake starts when the connection is
-        // accepted.
-        #[cfg(feature = "tcp-listener")]
-        if crate::tcp::process_listeners(&mut self.sockets.tcp_listeners, iface, &src_addr, &dst_addr, &tcp_repr) {
-            return;
-        }
-
-        // The packet wasn't handled by a socket: send a TCP RST packet.
-        // Never reply to a TCP RST packet with another TCP RST packet.
-        if tcp_repr.control != TcpControl::Rst {
+        if result == ProcessResult::Rst {
             let reply = TcpSocketState::rst_reply(&tcp_repr);
-            self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr);
+            self.transmit_tcp_rst(iface, &reply, dst_addr, src_addr);
         }
     }
 
-    /// Build and transmit an immediate reply to an ingress TCP segment: an RST, or
-    /// a challenge ACK from a socket's state machine.
+    /// Build and transmit an RST answering an ingress TCP segment. Best-effort,
+    /// like the other replies the stack generates.
     ///
-    /// The reply is routed before it is built, since its checksum is the egress
+    /// The RST is routed before it is built, since its checksum is the egress
     /// interface's to compute and that is not necessarily the arrival one. It is
     /// dropped if there is no route, or if the pool is empty.
     #[cfg(feature = "tcp")]
-    fn transmit_tcp_reply(&mut self, arrival: IfaceHandle, repr: &TcpRepr<'_>, src_addr: IpAddr, dst_addr: IpAddr) {
+    fn transmit_tcp_rst(&mut self, arrival: IfaceHandle, repr: &TcpRepr<'_>, src_addr: IpAddr, dst_addr: IpAddr) {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
         };

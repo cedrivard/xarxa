@@ -248,4 +248,122 @@ fn exhaustion() {
         stack.poll(retry);
         assert_eq!(tx.borrow().len(), 3);
     }
+
+    // The ACKs that received TCP segments call for right away wait for a buffer
+    // too. The segment's own buffer is free again by the time they are built, so
+    // one free buffer is enough to receive a segment and answer it.
+    #[cfg(feature = "tcp")]
+    {
+        use xarxa::tcp::State;
+        use xarxa::time::{Duration, Instant};
+        use xarxa::wire::{IPV4_HEADER_LEN, IpProtocol, Ipv4Packet, TCP_HEADER_LEN, TcpPacket, TcpSeqNumber};
+
+        let local = Ipv4Addr::new(192, 168, 1, 1);
+        let remote = Ipv4Addr::new(192, 168, 1, 2);
+        // A segment from port 80 of the remote to port 5000 here, as the device
+        // receives it.
+        let segment = |seq: TcpSeqNumber, ack: TcpSeqNumber, syn: bool, payload: &[u8]| {
+            let len = IPV4_HEADER_LEN + TCP_HEADER_LEN + payload.len();
+            let mut bytes = vec![0; len];
+            let mut ip = Ipv4Packet::new_unchecked(&mut bytes[..]);
+            ip.set_version(4);
+            ip.set_header_len(IPV4_HEADER_LEN as u8);
+            ip.set_total_len(len as u16);
+            ip.set_next_header(IpProtocol::Tcp);
+            ip.set_hop_limit(64);
+            ip.set_src_addr(remote);
+            ip.set_dst_addr(local);
+            ip.fill_checksum();
+            let mut tcp = TcpPacket::new_unchecked(&mut bytes[IPV4_HEADER_LEN..]);
+            tcp.set_src_port(80);
+            tcp.set_dst_port(5000);
+            tcp.set_seq_number(seq);
+            tcp.set_ack_number(ack);
+            tcp.set_header_len(TCP_HEADER_LEN as u8);
+            tcp.set_syn(syn);
+            tcp.set_ack(true);
+            tcp.set_window_len(1024);
+            tcp.payload_mut().copy_from_slice(payload);
+            tcp.fill_checksum(&remote.into(), &local.into());
+            bytes
+        };
+        // The ACK number of a pure ACK the stack sent.
+        let ack_number = |frame: &mut Vec<u8>| {
+            let tcp = TcpPacket::new_checked(&mut frame[IPV4_HEADER_LEN..]).unwrap();
+            assert!(tcp.ack() && !tcp.syn() && tcp.payload().is_empty());
+            tcp.ack_number()
+        };
+
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let device = TestDevice::new(Medium::Ip);
+        let (rx, tx, room) = (device.rx.clone(), device.tx.clone(), device.room.clone());
+        let iface = device.install(&mut stack, HardwareAddress::Ip);
+        stack.iface(iface).add_ip_addr(IpCidr::new(local.into(), 24)).unwrap();
+        let tcp = stack
+            .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
+            .unwrap();
+
+        // One free buffer from here on.
+        while let Some(buf) = PacketBuf::try_new() {
+            again.push(buf);
+        }
+        drop(again.pop());
+
+        // The handshake: the SYN, then the SYN|ACK in and its ACK out.
+        stack.tcp_socket(tcp).connect((remote, 80), 5000).unwrap();
+        let now = Instant::from_secs(1);
+        stack.poll(now);
+        let local_seq = {
+            let mut tx = tx.borrow_mut();
+            assert_eq!(tx.len(), 1);
+            let seq = TcpPacket::new_checked(&mut tx[0][IPV4_HEADER_LEN..])
+                .unwrap()
+                .seq_number();
+            tx.clear();
+            seq + 1
+        };
+        let remote_seq = TcpSeqNumber(1000);
+        rx.borrow_mut().push_back(segment(remote_seq, local_seq, true, b""));
+        stack.poll(now);
+        assert_eq!(stack.tcp_socket(tcp).state(), State::Established);
+        assert_eq!(tx.borrow_mut().drain(..).count(), 1);
+
+        // An out-of-order segment takes the free buffer, and still gets its
+        // duplicate ACK.
+        rx.borrow_mut()
+            .push_back(segment(remote_seq + 1 + 3, local_seq, false, b"def"));
+        stack.poll(now);
+        {
+            let mut tx = tx.borrow_mut();
+            assert_eq!(tx.len(), 1);
+            assert_eq!(ack_number(&mut tx[0]), remote_seq + 1);
+            tx.clear();
+        }
+
+        // The segment that fills the gap, while the device has no room. Then the
+        // device has room but the pool has no buffer, and the stack asks to be
+        // polled again soon to retry.
+        room.set(Some(0));
+        rx.borrow_mut()
+            .push_back(segment(remote_seq + 1, local_seq, false, b"abc"));
+        stack.poll(now);
+        assert!(tx.borrow().is_empty());
+        room.set(None);
+        again.push(PacketBuf::try_new().unwrap());
+        let retry = now + Duration::from_millis(1);
+        assert_eq!(stack.poll(now), retry);
+        assert!(tx.borrow().is_empty());
+
+        // A buffer is free by the retry, which sends the ACK.
+        drop(again.pop());
+        stack.poll(retry);
+        {
+            let mut tx = tx.borrow_mut();
+            assert_eq!(tx.len(), 1);
+            assert_eq!(ack_number(&mut tx[0]), remote_seq + 1 + 6);
+        }
+        let mut data = [0; 6];
+        assert_eq!(stack.tcp_socket(tcp).recv_slice(&mut data), Ok(6));
+        assert_eq!(&data, b"abcdef");
+    }
 }
