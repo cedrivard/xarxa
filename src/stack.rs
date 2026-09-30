@@ -2192,6 +2192,20 @@ impl StackInner {
         let source_protocol_addr = Ipv4Addr::from(<[u8; 4]>::try_from(arp_packet.source_protocol_addr()).unwrap());
         let target_protocol_addr = Ipv4Addr::from(<[u8; 4]>::try_from(arp_packet.target_protocol_addr()).unwrap());
 
+        // RFC 826 merges an existing sender mapping before checking the target.
+        // In particular, gratuitous ARP must replace an old hardware address.
+        // Only packets aimed at us may create an unsolicited cache entry. The rest
+        // of the ARP traffic on the link is ignored here, before the checks below
+        // log anything about it.
+        let for_us = iface.has_ip_addr(target_protocol_addr.into());
+        if !for_us
+            && !self
+                .neighbor_cache
+                .contains(&(iface.handle, IpAddr::V4(source_protocol_addr)))
+        {
+            return;
+        }
+
         // Only process REQUEST and RESPONSE.
         if !matches!(operation, ArpOperation::Request | ArpOperation::Reply) {
             debug!("arp: unknown operation code");
@@ -2209,18 +2223,6 @@ impl StackInner {
             return;
         }
 
-        // RFC 826 merges an existing sender mapping before checking the target.
-        // In particular, gratuitous ARP must replace an old hardware address.
-        // Only packets aimed at us may create an unsolicited cache entry.
-        let for_us = iface.has_ip_addr(target_protocol_addr.into());
-        if !for_us
-            && self
-                .neighbor_cache
-                .get(iface.handle, IpAddr::V4(source_protocol_addr))
-                .is_none()
-        {
-            return;
-        }
         self.fill_neighbor(
             iface,
             IpAddr::V4(source_protocol_addr),
