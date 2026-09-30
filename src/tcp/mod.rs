@@ -57,8 +57,8 @@ use crate::storage::Assembler;
 /// Every `dispatch` refreshes the socket's `ip_mtu` from the routed egress interface
 /// before sizing or sending anything, so this only stands in while there is no route.
 /// Capped by the packet buffer, so a segment sized by it always fits one.
-const DEFAULT_IP_MTU: usize = if PACKET_BUF_SIZE - LINK_HEADER_LEN < 1500 {
-    PACKET_BUF_SIZE - LINK_HEADER_LEN
+const DEFAULT_IP_MTU: usize = if PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN < 1500 {
+    PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN
 } else {
     1500
 };

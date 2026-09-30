@@ -199,6 +199,7 @@ def collect():
             args += ["--features", extra]
         cmds.raw(args)
     cmds.raw(["test", "-p", "xarxa-driver"])
+    cmds.raw(["test", "-p", "xarxa-driver", "--features", "packet-buf-driver-headroom-32"])
 
     cmds.raw(["test"])
     # Test serde (de)serialize specifically with just ipv4 or just ipv6
@@ -213,6 +214,10 @@ def collect():
     # the other. (Without either feature TCP does no congestion control at all,
     # and the tests that exercise a congestion window are gated on `tcp-reno`.)
     cmds.test(join("alloc", FULL, "tcp-reno"), lib=False)
+    # Once more with driver headroom: every packet handed to a driver must have
+    # it, and it comes out of the room left for headers and payload.
+    for headroom in ["packet-buf-driver-headroom-16", "packet-buf-driver-headroom-32"]:
+        cmds.test(join("alloc", FULL, headroom))
     cmds.raw(["build", "--examples"])
 
     return cmds.all()

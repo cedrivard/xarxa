@@ -18,7 +18,7 @@ pub mod slaac;
 pub use crate::multicast::MulticastError;
 
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
-use crate::driver::config::PACKET_BUF_SIZE;
+use crate::driver::config::{PACKET_BUF_DRIVER_HEADROOM, PACKET_BUF_SIZE};
 use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 use crate::error::Full;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -764,7 +764,7 @@ impl IfaceState<'_> {
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => crate::sixlowpan::ip_mtu(caps.max_transmission_unit),
         };
-        mtu.min(PACKET_BUF_SIZE - LINK_HEADER_LEN)
+        mtu.min(PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN)
     }
 
     /// Whether the device can take one more frame right now.

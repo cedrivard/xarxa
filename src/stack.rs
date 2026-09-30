@@ -1,7 +1,6 @@
 //! The network stack.
 
-#[cfg(feature = "ipv6")]
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::IFACE_COUNT;
 #[cfg(feature = "_raw")]
@@ -1610,7 +1609,7 @@ impl<'d> Stack<'d> {
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
-                if !buf.ensure_headroom(LINK_HEADER_LEN + IPV4_HEADER_LEN) {
+                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN) {
                     trace!("icmpv4: not enough headroom for echo reply");
                     return;
                 }
@@ -1852,7 +1851,7 @@ impl<'d> Stack<'d> {
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
-                if !buf.ensure_headroom(LINK_HEADER_LEN + IPV6_HEADER_LEN) {
+                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN) {
                     trace!("icmpv6: not enough headroom for echo reply");
                     return;
                 }
@@ -2227,8 +2226,6 @@ impl StackInner {
         );
 
         if operation == ArpOperation::Request {
-            use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("arp: no packet buffer for reply");
                 return;
@@ -2283,8 +2280,6 @@ impl StackInner {
         {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option.
-
-            use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("ndisc: no packet buffer for neighbor advert");
                 return;
@@ -2547,8 +2542,6 @@ impl StackInner {
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
     fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Addr) {
-        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             debug!("arp: no source address for request");
             return;
@@ -2578,8 +2571,6 @@ impl StackInner {
 
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) {
-        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
@@ -2776,7 +2767,7 @@ impl StackInner {
     }
 
     pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
-        debug_assert!(buf.headroom() >= xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+        debug_assert!(buf.headroom() >= PACKET_BUF_DRIVER_HEADROOM);
 
         #[cfg(feature = "packet-log")]
         {
@@ -2876,8 +2867,6 @@ fn build_icmpv4_error(
     msg_code: u8,
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
-    use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-
     let mut reply = PacketBuf::try_new()?;
     reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
     // A buffer smaller than the minimum MTU quotes less.
@@ -5968,7 +5957,7 @@ pub(crate) mod test {
                 100,
                 ip_mtu,
                 ip_mtu + 1,
-                crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN,
+                crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN,
             ] {
                 tx.borrow_mut().clear();
 

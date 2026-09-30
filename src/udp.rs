@@ -905,7 +905,7 @@ impl UdpSocket<'_, '_> {
             #[cfg(feature = "ipv6")]
             IpAddr::V6(_) => IPV6_HEADER_LEN,
         };
-        let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
+        let headroom = PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
         if self.tx.can_transmit(route.iface).is_err() {
             // `Stack::poll` wakes the socket once the interface has room.
@@ -922,7 +922,7 @@ impl UdpSocket<'_, '_> {
             return Err(SendError::BufferFull);
         }
         buf.set_meta(meta.meta);
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
+        buf.reserve(headroom);
         buf.set_len(max_size);
 
         let egress = DatagramEgress {
@@ -1975,7 +1975,8 @@ mod test {
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
-        let max = crate::driver::config::PACKET_BUF_SIZE - (LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        let max = crate::driver::config::PACKET_BUF_SIZE
+            - (PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let remote = SocketAddr::new(REMOTE_ADDR.into(), REMOTE_PORT);
 
         // One byte too many: rejected, nothing transmitted.

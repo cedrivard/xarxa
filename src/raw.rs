@@ -524,12 +524,13 @@ impl RawSocket<'_, '_> {
 
         // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
         // on Ethernet mediums, so they need headroom for it.
-        let headroom = match mode {
-            #[cfg(feature = "raw-ethernet")]
-            RawMode::Ethernet { .. } => 0,
-            #[cfg(feature = "raw-ip")]
-            RawMode::Ip { .. } => LINK_HEADER_LEN,
-        };
+        let headroom = PACKET_BUF_DRIVER_HEADROOM
+            + match mode {
+                #[cfg(feature = "raw-ethernet")]
+                RawMode::Ethernet { .. } => 0,
+                #[cfg(feature = "raw-ip")]
+                RawMode::Ip { .. } => LINK_HEADER_LEN,
+            };
 
         // Ethernet frames carry no routing information: a bound socket sends on
         // its interface, an unbound one on the first Ethernet interface. The
@@ -564,7 +565,7 @@ impl RawSocket<'_, '_> {
             return Err(SendError::BufferFull);
         }
         buf.set_meta(meta);
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
+        buf.reserve(headroom);
         buf.set_len(max_size);
         let size = f(&mut buf);
         assert!(size <= max_size);
@@ -1301,7 +1302,7 @@ mod test {
         // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
         assert_eq!(
             stack.raw_socket(handle).send_with(
-                crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN + 1,
+                crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN + 1,
                 |_| unreachable!()
             ),
             Err(SendError::BufferFull)
@@ -1435,7 +1436,7 @@ mod test {
         );
         // Too big for a packet buffer: IP mode leaves room for the link header,
         // whatever medium the packet ends up going out of.
-        let max = crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN;
+        let max = crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN;
         assert_eq!(
             stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(SendError::BufferFull)

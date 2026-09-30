@@ -9,6 +9,7 @@
 
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
+use crate::driver::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::error::{Full, Malformed};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
@@ -630,7 +631,7 @@ impl StackInner {
             #[cfg(not(feature = "sixlowpan-fragmentation"))]
             debug!("Enable the `sixlowpan-fragmentation` feature for fragmentation support.");
         } else {
-            if !buf.ensure_headroom(ieee_len) {
+            if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + ieee_len) {
                 debug!("6LoWPAN: no room for the MAC header, dropping");
                 return;
             }
@@ -890,6 +891,7 @@ impl StackInner {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
+        tx_buffer.reserve(PACKET_BUF_DRIVER_HEADROOM);
         tx_buffer.set_len(ieee_len + frag_len + frag_size);
         ieee_repr.emit(&mut tx_buffer[..ieee_len]);
         frag_repr.emit(&mut tx_buffer[ieee_len..ieee_len + frag_len]);
@@ -929,8 +931,6 @@ impl StackInner {
     allow(unused_imports, dead_code)
 )]
 mod test {
-    use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
-
     use super::*;
     use crate::iface::Medium;
     use crate::iface::{AddrOrigin, IfaceHandle};
